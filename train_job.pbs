@@ -1,0 +1,86 @@
+#!/bin/bash
+#PBS -N Habitat_Train
+#PBS -l select=1:ncpus=12:mem=48gb
+#PBS -l walltime=24:00:00
+#PBS -q parallel
+#PBS -j oe
+#PBS -P Personal
+
+# =============================================================================
+# NUS HPC (Atlas) Environment Setup
+# =============================================================================
+
+# 1. Load Environment (Standard Conda/Miniconda)
+source ~/.bashrc
+
+# List environments for debugging
+echo "Available environments:"
+conda env list || true
+
+# Try activating 'habitat_old' environment
+# We try multiple methods to ensure success on different HPC configurations
+{
+    conda activate habitat_old
+} || {
+    source activate habitat_old
+} || {
+    eval "$(micromamba shell hook --shell bash)"
+    micromamba activate habitat_old
+} || {
+    echo "ERROR: Could not activate 'habitat_old' environment."
+    exit 1
+}
+
+# Verify environment and torch installation
+echo "Active Environment: $CONDA_PREFIX"
+python -c "import torch; print('Torch version:', torch.__version__)" || {
+    echo "ERROR: Torch not found in current environment!"
+    exit 1
+}
+
+# Check dependencies (Install manually on Login Node if missing!)
+python -c "import tensorboard, ray, cv2, skimage, scipy, imageio, matplotlib, openai" 2>/dev/null || {
+    echo "ERROR: Missing Python dependencies."
+    echo "Please run this on Login Node:"
+    echo "pip install tensorboard ray opencv-python-headless scikit-image imageio matplotlib scipy openai"
+    exit 1
+}
+
+# 2. Fix GLIBC/Library issues (Crucial for CentOS 7)
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+# Force Python to use UTF-8 for Chinese comments
+export PYTHONIOENCODING=utf-8
+# Force Matplotlib to use non-interactive backend (Headless)
+export MPLBACKEND=Agg
+
+# 3. Headless Rendering Setup (Crucial for Habitat/Gym)
+export MAGNUM_LOG=quiet
+export HABITAT_SIM_LOG=quiet
+# Use EGL for headless rendering if supported, otherwise software rendering might be needed
+# For Habitat on headless servers, we usually need EGL
+export MAGNUM_GPU_VALIDATION=ON
+
+# =============================================================================
+# Job Execution
+# =============================================================================
+
+# Move to the directory where the job was submitted
+cd "$PBS_O_WORKDIR"
+
+echo "Job started on $(hostname) at $(date)"
+echo "Current directory: $(pwd)"
+echo "Environment: $CONDA_PREFIX"
+
+# Check GPU availability (only if nvidia-smi exists)
+if command -v nvidia-smi &> /dev/null; then
+    nvidia-smi
+else
+    echo "No GPU found or nvidia-smi not available (running on CPU node)"
+fi
+
+# Run the training script
+# Using unbuffered output (-u) to see logs in real-time
+# Redirect output to a file so it is visible immediately (bypassing PBS spooling)
+python -u driver.py > "training_log_${PBS_JOBID%%.*}.txt" 2>&1
+
+echo "Job finished at $(date)"

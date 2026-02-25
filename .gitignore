@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+
+# Project specific
+maps/
+gifs/
+model/
+train/
+data/
+tb/
+logs/
+*.log
+wandb/

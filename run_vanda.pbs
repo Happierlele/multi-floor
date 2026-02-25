@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N habitat_vanda
+#PBS -q volta_gpu
+#PBS -l select=1:ncpus=10:mem=60gb:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o habitat_vanda_job.out
+
+# =============================================================================
+# Vanda GPU Job Script
+# =============================================================================
+
+cd "$PBS_O_WORKDIR" || exit 1
+LOG="habitat_vanda_log_${PBS_JOBID%%.*}.txt"
+
+echo "Job ${PBS_JOBID} started at: $(date)" > "$LOG"
+echo "Node: $(hostname)" >> "$LOG"
+nvidia-smi >> "$LOG" 2>&1
+
+# 1. Environment Variables for GPU
+# DISABLE forced software rendering
+export FORCE_SW_RENDER=0
+export MAGNUM_LOG=quiet
+export MAGNUM_GPU_VALIDATION=OFF
+export PYTHONIOENCODING=utf-8
+
+# Ray Configuration
+export RAY_TMPDIR=/tmp/ray
+mkdir -p $RAY_TMPDIR
+export RAY_DASHBOARD_HOST=0.0.0.0
+export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
+
+# 2. Activate Vanda Environment
+source ~/.bashrc
+source "$(conda info --base)/etc/profile.d/conda.sh"
+ENV_PATH="/hpctmp/$(whoami)/envs/habitat_vanda"
+
+if [ -d "$ENV_PATH" ]; then
+    conda activate "$ENV_PATH"
+else
+    echo "❌ Error: Environment $ENV_PATH not found! Did you run setup_vanda.sh?" >> "$LOG"
+    exit 1
+fi
+
+echo "Environment activated: $CONDA_DEFAULT_ENV" >> "$LOG"
+echo "Python: $(which python)" >> "$LOG"
+
+# 3. Run Driver
+echo "Starting Driver (GPU Mode)..." >> "$LOG"
+python driver.py >> "$LOG" 2>&1
