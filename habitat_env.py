@@ -158,7 +158,22 @@ class HabitatEnv:
                      sim.pathfinder.load_nav_mesh(navmesh_file)
                      print(f"[HabitatEnv] Loaded NavMesh from {navmesh_file}", flush=True)
                  else:
-                     print(f"[HabitatEnv] Warning: NavMesh file {navmesh_file} not found.", flush=True)
+                     recompute = os.environ.get("HABITAT_RECOMPUTE_NAVMESH", "0").strip() == "1"
+                     if recompute:
+                         try:
+                             navmesh_settings = habitat_sim.NavMeshSettings()
+                             if hasattr(navmesh_settings, "set_defaults"):
+                                 navmesh_settings.set_defaults()
+                             ok = sim.recompute_navmesh(sim.pathfinder, navmesh_settings)
+                             if ok and hasattr(sim.pathfinder, "save_nav_mesh"):
+                                 sim.pathfinder.save_nav_mesh(navmesh_file)
+                                 print(f"[HabitatEnv] Recomputed & saved NavMesh to {navmesh_file}", flush=True)
+                             else:
+                                 print("[HabitatEnv] NavMesh recompute failed or save_nav_mesh unavailable.", flush=True)
+                         except Exception as e:
+                             print(f"[HabitatEnv] NavMesh recompute failed: {e}", flush=True)
+                     else:
+                         print(f"[HabitatEnv] Warning: NavMesh file {navmesh_file} not found.", flush=True)
             return sim
         except Exception as e:
             print(f"[HabitatEnv] Failed to init Habitat Simulator: {e}", flush=True)
