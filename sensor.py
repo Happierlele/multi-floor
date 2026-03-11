@@ -42,10 +42,7 @@ def collision_check(x0, y0, x1, y1, ground_truth, robot_belief):
     return robot_belief
 
 
-def sensor_work(robot_position, sensor_range, robot_belief, ground_truth=None):
-    if ground_truth is None:
-        return robot_belief
-
+def sensor_work(robot_position, sensor_range, robot_belief, ground_truth):
     sensor_angle_inc = 0.5 / 180 * np.pi
     sensor_angle = 0
     x0 = robot_position[0]

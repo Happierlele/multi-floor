@@ -14,20 +14,14 @@ class Env:
         self.plot = plot
         self.floor_id = floor_id # Explicit floor ID
         self.ground_truth, self.robot_cell, self.map_list, self.map_index, self.stairs_cells = self.import_ground_truth(episode_index)
-        if self.ground_truth is not None:
-            self.ground_truth_size = np.shape(self.ground_truth)  # cell
-            self.robot_location = np.array([0.0, 0.0])  # meter
-            self.robot_belief = np.ones(self.ground_truth_size) * 127
-            self.belief_origin_x = -np.round(self.robot_cell[0] * self.cell_size, 1)   # meter
-            self.belief_origin_y = -np.round(self.robot_cell[1] * self.cell_size, 1)  # meter
-        else:
-            # Blind mode default initialization
-            self.ground_truth_size = (2000, 2000)
-            self.robot_cell = np.array([1000, 1000])
-            self.robot_location = np.array([0.0, 0.0])
-            self.robot_belief = np.ones(self.ground_truth_size) * 127
-            self.belief_origin_x = -np.round(self.robot_cell[0] * self.cell_size, 1)
-            self.belief_origin_y = -np.round(self.robot_cell[1] * self.cell_size, 1)
+        self.ground_truth_size = np.shape(self.ground_truth)  # cell
+        self.cell_size = CELL_SIZE  # meter
+
+        self.robot_location = np.array([0.0, 0.0])  # meter
+
+        self.robot_belief = np.ones(self.ground_truth_size) * 127
+        self.belief_origin_x = -np.round(self.robot_cell[0] * self.cell_size, 1)   # meter
+        self.belief_origin_y = -np.round(self.robot_cell[1] * self.cell_size, 1)  # meter
 
         self.global_frontiers = set()
 
@@ -65,8 +59,7 @@ class Env:
         map_list = os.listdir(map_dir)
         map_list.sort() # Ensure deterministic order
         if len(map_list) == 0:
-            print("Warning: No maps found in 'maps' directory. Running in blind mode.")
-            return None, None, [], 0, None
+            raise ValueError("No maps found in 'maps' directory")
         start_index = episode_index % np.size(map_list)
         map_index = start_index
         ground_truth_raw = None
@@ -86,8 +79,7 @@ class Env:
                 break
             map_index = (map_index + 1) % np.size(map_list)
             if map_index == start_index:
-                print("Warning: No map contains a robot start cell with value 208. Running in blind mode.")
-                return None, None, [], 0, None
+                raise ValueError("No map contains a robot start cell with value 208")
 
         ground_truth = ground_truth_tmp
 
@@ -135,14 +127,7 @@ class Env:
         return reward
 
     def evaluate_exploration_rate(self):
-        if self.ground_truth is None:
-            self.explored_rate = 0
-            return
-        gt_free = np.sum(self.ground_truth == 255)
-        if gt_free > 0:
-            self.explored_rate = np.sum(self.robot_belief == 255) / gt_free
-        else:
-            self.explored_rate = 0
+        self.explored_rate = np.sum(self.robot_belief == 255) / np.sum(self.ground_truth == 255)
 
     def discover_stairs(self):
         if not hasattr(self, "stairs_coords_list") or self.stairs_coords_list is None:
@@ -191,26 +176,13 @@ class Env:
         # Increment floor ID
         self.floor_id += 1
         
-        gt, robot_cell, _, _, stairs_cells = self.import_ground_truth(self.map_index)
-        
-        if gt is not None:
-            self.ground_truth = gt
-            self.robot_cell = robot_cell
-            self.stairs_cells = stairs_cells
-            self.ground_truth_size = np.shape(self.ground_truth)
-            
-            self.robot_location = np.array([0.0, 0.0])
-            self.robot_belief = np.ones(self.ground_truth_size) * 127
-            self.belief_origin_x = -np.round(self.robot_cell[0] * self.cell_size, 1)
-            self.belief_origin_y = -np.round(self.robot_cell[1] * self.cell_size, 1)
-            
-            self.robot_belief = sensor_work(self.robot_cell, self.sensor_range / self.cell_size, self.robot_belief, self.ground_truth)
-        else:
-            print("Warning: Failed to switch map (GT missing). Resetting belief only.")
-            self.robot_belief = np.ones(self.ground_truth_size) * 127
-            self.robot_location = np.array([0.0, 0.0])
-            # Keep previous origins and cells
-            
+        self.ground_truth, self.robot_cell, _, _, self.stairs_cells = self.import_ground_truth(self.map_index)
+        self.robot_location = np.array([0.0, 0.0])
+        self.robot_belief = np.ones(np.shape(self.ground_truth)) * 127
+        self.belief_origin_x = -np.round(self.robot_cell[0] * self.cell_size, 1)
+        self.belief_origin_y = -np.round(self.robot_cell[1] * self.cell_size, 1)
+        self.robot_belief = sensor_work(self.robot_cell, self.sensor_range / self.cell_size, self.robot_belief,
+                                        self.ground_truth)
         self.old_belief = deepcopy(self.robot_belief)
         self.travel_dist = 0
         self.explored_rate = 0
@@ -281,10 +253,17 @@ class Env:
         self.belief_info.update_map_info(self.robot_belief, self.belief_origin_x, self.belief_origin_y)
 
     def reset_semantic_map(self):
-        self.robot_belief = np.ones(self.ground_truth_size) * UNKNOWN
-        self.update_robot_location(self.robot_location)
-        self.robot_belief = sensor_work(self.robot_cell, self.sensor_range / self.cell_size, self.robot_belief, self.ground_truth)
-        self.old_belief = deepcopy(self.robot_belief)
-        self.belief_info.update_map_info(self.robot_belief, self.belief_origin_x, self.belief_origin_y)
-        self.global_frontiers = set()
-        self.explored_rate = 0
+        # Do NOT clear the map, just clear temporary obstacles if needed, or do nothing.
+        # Clearing map causes "amnesia" and graph rebuild from scratch.
+        # For now, let's just refresh sensor reading to clear dynamic obstacles?
+        # Actually, if we are stuck, we might want to clear local area only?
+        # But for this task, clearing everything is too aggressive.
+        # Let's KEEP the map but maybe re-evaluate location.
+        pass 
+        # self.robot_belief = np.ones(self.ground_truth_size) * UNKNOWN
+        # self.update_robot_location(self.robot_location)
+        # self.robot_belief = sensor_work(self.robot_cell, self.sensor_range / self.cell_size, self.robot_belief, self.ground_truth)
+        # self.old_belief = deepcopy(self.robot_belief)
+        # self.belief_info.update_map_info(self.robot_belief, self.belief_origin_x, self.belief_origin_y)
+        # self.global_frontiers = set()
+        # self.explored_rate = 0

@@ -44,12 +44,16 @@ def test_vlm_adapter():
     observation = [None, None, None, None, current_edge, None]
     
     print("Testing VLM Adapter...")
+    
+    # Mock call_vlm_api to return "0" deterministically
+    adapter.call_vlm_api = MagicMock(return_value="0")
+    
     next_pos, action_idx = adapter.get_vlm_action(agent, observation)
     
     print(f"Action Index: {action_idx.item()}")
     print(f"Next Position: {next_pos}")
     
-    assert action_idx.item() == 0 # Mock returns "0"
+    assert action_idx.item() == 1 # VLM returns the node index (which is 1), not the index in candidate list
     assert np.allclose(next_pos, agent.node_coords[1]) # Node 1 is at index 0 of candidates
     
     print("Test Passed!")

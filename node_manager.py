@@ -89,16 +89,8 @@ class NodeManager:
              nearest_existing_node = min(existing_nodes_nearby, key=lambda n: np.linalg.norm(n.data.coords - robot_location)).data
              min_dist_to_existing = np.linalg.norm(nearest_existing_node.coords - robot_location)
         
-        # Consider both theoretical grid candidates and existing nodes
-        min_dist_effective = min(min_dist_to_candidates, min_dist_to_existing)
-
-        # Increase threshold to 2.0m (half of NODE_RESOLUTION 4.0m) to aggressively snap to existing nodes
-        if min_dist_effective > 2.0: 
-              print(f"[NodeManager] Adding off-grid node at robot location {robot_location} (min_dist={min_dist_effective:.2f})")
-              if len(node_coords) > 0:
-                  node_coords = np.vstack([node_coords, robot_location])
-              else:
-                  node_coords = np.array([robot_location])
+        if len(node_coords) == 0 and min_dist_to_existing == float('inf'):
+              node_coords = np.array([np.around(robot_location, 1)])
         elif min_dist_to_existing <= 2.0 and nearest_existing_node is not None:
               # Snap to existing node (likely an off-grid node from previous step)
               # Ensure it is included in update list
@@ -137,7 +129,7 @@ class NodeManager:
                 if not hasattr(node, 'floor_id'):
                     node.floor_id = floor_id
                     
-                if node.utility == 0 or np.linalg.norm(node.coords - robot_location) > 2 * SENSOR_RANGE:
+                if np.linalg.norm(node.coords - robot_location) > 2 * SENSOR_RANGE:
                     pass
                 else:
                     node.update_node_observable_frontiers(new_frontier, global_frontiers, updating_map_info)
@@ -160,7 +152,7 @@ class NodeManager:
         if current_robot_node and len(current_robot_node.neighbor_set) <= 1:
              print(f"[NodeManager] Emergency: Node {current_robot_node.coords} (at robot loc) has no neighbors! Forcing connection.")
              # Find nearest node in the whole graph
-             search_radius = NODE_RESOLUTION * 3.0 # Search wider
+             search_radius = max(NODE_RESOLUTION * 4.0, 8.0)
              bbox = quads.BoundingBox(
                 min_x=current_robot_node.coords[0] - search_radius, min_y=current_robot_node.coords[1] - search_radius,
                 max_x=current_robot_node.coords[0] + search_radius, max_y=current_robot_node.coords[1] + search_radius
@@ -176,6 +168,15 @@ class NodeManager:
                  candidates.append((d, n))
             
              candidates.sort(key=lambda x: x[0])
+             if not candidates:
+                 all_wrappers = list(self.nodes_dict.__iter__())
+                 for wrapper in all_wrappers:
+                     n = wrapper.data
+                     if n == current_robot_node:
+                         continue
+                     d = np.linalg.norm(n.coords - current_robot_node.coords)
+                     candidates.append((d, n))
+                 candidates.sort(key=lambda x: x[0])
              
              for d, n in candidates[:3]:
                  print(f"[NodeManager] Force connecting {current_robot_node.coords} <-> {n.coords} (dist={d:.2f})")
@@ -431,7 +432,7 @@ class NodeManager:
             open_list.remove(n)
             closed_list.add(n)
 
-        print('Path does not exist!')
+        # print('Path does not exist!')
         return [], 1e8
 
 
@@ -456,23 +457,36 @@ class Node:
         if len(frontiers) == 0:
             self.utility = 0
             return set()
-        else:
-            observable_frontiers = set()
-            frontiers = np.array(list(frontiers)).reshape(-1, 2)
-            dist_list = np.linalg.norm(frontiers - self.coords, axis=-1)
-            new_frontiers_in_range = frontiers[dist_list < self.utility_range]
-            for point in new_frontiers_in_range:
-                # Fix: Convert to grid coordinates for collision check
-                start_cell = get_cell_position_from_coords(self.coords, updating_map_info)
-                end_cell = get_cell_position_from_coords(point, updating_map_info)
-                collision = check_collision(start_cell[0], start_cell[1], end_cell[0], end_cell[1], updating_map_info.map)
-                if not collision:
-                    observable_frontiers.add((point[0], point[1]))
-            self.utility = len(observable_frontiers)
-            if self.utility <= MIN_UTILITY:
-                self.utility = 0
-                observable_frontiers = set()
-            return observable_frontiers
+        coords_list = []
+        try:
+            for f in frontiers:
+                if isinstance(f, (list, tuple)):
+                    if len(f) == 2 and isinstance(f[0], (list, tuple, np.ndarray)) and np.isscalar(f[1]):
+                        c = np.array(f[0], dtype=float).reshape(2)
+                        coords_list.append(c)
+                    elif len(f) == 2 and np.isscalar(f[0]) and np.isscalar(f[1]):
+                        coords_list.append(np.array([float(f[0]), float(f[1])], dtype=float))
+                else:
+                    a = np.array(f)
+                    if a.shape[-1] == 2:
+                        coords_list.append(a.astype(float))
+        except Exception:
+            pass
+        if len(coords_list) == 0:
+            self.utility = 0
+            return set()
+        frontiers_arr = np.array(coords_list, dtype=float).reshape(-1, 2)
+        observable_frontiers = set()
+        dist_list = np.linalg.norm(frontiers_arr - self.coords, axis=-1)
+        new_frontiers_in_range = frontiers_arr[dist_list < self.utility_range]
+        for point in new_frontiers_in_range:
+            start_cell = get_cell_position_from_coords(self.coords, updating_map_info)
+            end_cell = get_cell_position_from_coords(point, updating_map_info)
+            collision = check_collision(start_cell[0], start_cell[1], end_cell[0], end_cell[1], updating_map_info.map)
+            if not collision:
+                observable_frontiers.add((point[0], point[1]))
+        self.utility = len(observable_frontiers)
+        return observable_frontiers
 
     def update_neighbor_nodes(self, updating_map_info, nodes_dict):
         # Robust Logic: Search for nearby nodes using QuadTree range search
@@ -520,9 +534,6 @@ class Node:
                 # Bidirectional connection: Ensure neighbor also connects to this node
                 neighbor_node.neighbor_set.add((self.coords[0], self.coords[1]))
 
-        if self.utility == 0:
-            self.need_update_neighbor = False
-
     def update_node_observable_frontiers(self, new_frontiers, global_frontiers, updating_map_info):
         # remove frontiers observed
         frontiers_observed = []
@@ -546,9 +557,6 @@ class Node:
                     self.observable_frontiers.add((point[0], point[1]))
 
         self.utility = len(self.observable_frontiers)
-        if self.utility <= MIN_UTILITY:
-            self.utility = 0
-            self.observable_frontiers = set()
 
     def set_visited(self):
         self.visited = 1

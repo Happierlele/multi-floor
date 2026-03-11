@@ -122,7 +122,7 @@ class RLRunner(Runner):
                 from habitat_env import HabitatEnv
                 # Initialize with dummy values, will be reset later via reset_episode
                 # This ensures EGL context is created and claimed before Torch
-                self.persistent_env = HabitatEnv(0, plot=False)
+                self.persistent_env = HabitatEnv(0, plot=True)
                 print(f"[RLRunner {meta_agent_id}] Persistent HabitatEnv initialized!", flush=True)
             except Exception as e:
                 print(f"[RLRunner {meta_agent_id}] Failed to init HabitatEnv: {e}", flush=True)
@@ -135,7 +135,7 @@ class RLRunner(Runner):
         # Create persistent Worker using the pre-initialized environment
         if self.persistent_env:
             print(f"[RLRunner {meta_agent_id}] Creating Persistent Worker...", flush=True)
-            self.worker = Worker(self.meta_agent_id, self.network, self.stair_switch_net, 0, device=self.device, save_image=False,
+            self.worker = Worker(self.meta_agent_id, self.network, self.stair_switch_net, 0, device=self.device, save_image=True,
                         use_vlm=USE_VLM, vlm_model_name=VLM_MODEL_NAME, env=self.persistent_env)
             print(f"[RLRunner {meta_agent_id}] Persistent Worker created!", flush=True)
 

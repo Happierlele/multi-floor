@@ -65,9 +65,10 @@ def plot_env(self, step):
                 sy = (coords[1] - self.belief_origin_y) / self.mapper.cell_size
                 
                 if is_target:
-                    plt.plot(sx, sy, 'y*', markersize=12, markeredgecolor='k', zorder=8, label='Target Stair')
+                    plt.plot(sx, sy, 'y*', markersize=14, markeredgecolor='k', zorder=8, label='Target Stair')
                 else:
-                    plt.plot(sx, sy, 'r*', markersize=8, markeredgecolor='k', zorder=7, label='Discovered Stair')
+                    # Changed from 'r*' to 'y^' (Yellow Triangle) to distinguish from Robot (Magenta Circle)
+                    plt.plot(sx, sy, 'y^', markersize=10, markeredgecolor='k', zorder=7, label='Discovered Stair')
 
     # Plot Frontiers (Green dots)
     if hasattr(self, "global_frontiers") and self.global_frontiers:
@@ -127,3 +128,7 @@ def reset_semantic_map(self):
     
     self.global_frontiers = []
     self.explored_rate = 0
+    
+    # Reset trajectory to prevent old lines from persisting on new map
+    self.trajectory_x = []
+    self.trajectory_y = []

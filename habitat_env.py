@@ -35,6 +35,7 @@ class HabitatEnv:
         self.episode_index = episode_index
         self.plot = plot
         self.floor_id = 0
+        self.floor_states = {} # floor_id -> mapper state
         
         # 1. 初始化 Habitat 仿真器
         self.sim = self._init_habitat()
@@ -226,6 +227,16 @@ class HabitatEnv:
         print(f"[HabitatEnv] Ground Truth Map generated. Free cells: {free_count}", flush=True)
         return gt_map
 
+    def update_ground_truth_for_floor(self, height):
+        """
+        Regenerate the ground truth map for a specific floor height.
+        This is crucial for multi-floor environments to ensure the GT map matches the current floor.
+        """
+        self.ground_truth = self._get_ground_truth_map(floor_height=height)
+        self.ground_truth_info = MapInfo(self.ground_truth, self.belief_origin_x, self.belief_origin_y, CELL_SIZE)
+        print(f"[HabitatEnv] Ground Truth updated for height {height:.2f}m", flush=True)
+
+
     def _generate_stairs(self):
         """
         Simulate stairs locations by picking random navigable points on the current floor.
@@ -235,18 +246,10 @@ class HabitatEnv:
         self.stairs_coords_list = []
         self.discovered_stairs = set()
         
-        # DISABLE SIMULATED STAIRS FOR REALISM
-        # The user requested to remove fake stairs in belief map if they don't exist in reality.
-        # If real stairs are found (e.g. from semantic scene), they should be added here.
-        # For now, we leave it empty to avoid confusion.
-        return
-
-        if not self.sim or not self.sim.pathfinder.is_loaded:
-            return
-
         # SIMULATION ONLY: Generate virtual stairs for testing
         print("[HabitatEnv] NOTICE: Generating VIRTUAL/SIMULATED stairs for multi-floor logic testing.", flush=True)
         num_stairs = 2
+        self.stairs_coords_list = [] # Initialize list
         for _ in range(num_stairs):
             try:
                 # Try to find a point somewhat far from robot? 
@@ -258,6 +261,7 @@ class HabitatEnv:
                 pass
         
         print(f"[HabitatEnv] Generated {len(self.stairs_coords_list)} simulated stairs locations.", flush=True)
+        return
 
     def discover_stairs(self):
         """
@@ -285,6 +289,9 @@ class HabitatEnv:
         if self.sim:
             # Randomize start position on NavMesh for new episodes
             if self.sim.pathfinder.is_loaded:
+                 # Generate simulated stairs if not already present
+                 if not self.stairs_coords_list:
+                     self._generate_stairs()
                  # Try to find a navigable point
                  num_retries = 100
                  for _ in range(num_retries):
@@ -395,7 +402,11 @@ class HabitatEnv:
         current_state = self.sim.get_agent(0).get_state()
         new_state = habitat_sim.AgentState()
         new_state.position = target_pos_3d
-        new_state.rotation = current_state.rotation
+        import quaternion
+        dx = target_pos_3d[0] - current_state.position[0]
+        dz = target_pos_3d[2] - current_state.position[2]
+        yaw = np.arctan2(dz, dx)
+        new_state.rotation = quaternion.from_rotation_vector(np.array([0, yaw, 0]))
         self.sim.get_agent(0).set_state(new_state)
         
         observations = self.sim.get_sensor_observations()
@@ -404,6 +415,10 @@ class HabitatEnv:
         self.robot_belief = self.mapper.update(observations['depth_sensor'], sensor_state, agent_state)
         self.belief_info.update_map_info(self.robot_belief, self.mapper.origin_x, self.mapper.origin_y)
         self.update_robot_location_from_sim(agent_state)
+        
+        # Record trajectory at every micro-step for smooth visualization
+        self.trajectory_x.append(self.robot_location[0])
+        self.trajectory_y.append(self.robot_location[1])
         
         if 'color_sensor' in observations:
             self.rgb_image = observations['color_sensor'][..., :3]
@@ -417,10 +432,11 @@ class HabitatEnv:
             plt.close()
             self.frame_files.append(filename)
 
-    def step(self, next_waypoint):
+    def step(self, next_waypoint, force=False):
         """
         Moves the robot to next_waypoint using Dijkstra/A* pathfinding on the belief map.
         Simulates step-by-step movement to respect obstacles and update map continuously.
+        If force=True, falls back to NavMesh pathfinding if Belief Map path fails.
         """
         if not self.sim: return 0
         
@@ -428,43 +444,76 @@ class HabitatEnv:
         current_state = self.sim.get_agent(0).get_state()
         height = current_state.position[1]
         
-        # 1. Path Planning on Belief Map
-        start_cell = get_cell_position_from_coords(self.robot_location, self.belief_info)
-        end_cell = get_cell_position_from_coords(next_waypoint, self.belief_info)
-        
-        # Check if start/end are valid
-        if start_cell is None or end_cell is None:
-             print(f"[HabitatEnv] Invalid start/end for path planning: {start_cell} -> {end_cell}")
-             return -1.0
+        path_coords_list = []
+        path = None
 
-        # Use A* on grid
-        path = get_grid_path(self.robot_belief, start_cell, end_cell)
-        
-        if path is None:
-            print(f"[HabitatEnv] Path planning failed to {next_waypoint}. Obstacle detected or unreachable.")
-            return -0.1 # Penalty for invalid move attempt
+        if force:
+            nav_path = self.get_shortest_path(self.robot_location, next_waypoint)
+            if nav_path:
+                path_coords_list = nav_path
+            else:
+                print(f"[HabitatEnv] Force=True but NavMesh path failed. Falling back to belief map A*.", flush=True)
+                force = False
+
+        if not force:
+            start_cell = get_cell_position_from_coords(self.robot_location, self.belief_info)
+            end_cell = get_cell_position_from_coords(next_waypoint, self.belief_info)
+            
+            if start_cell is None or end_cell is None:
+                print(f"[HabitatEnv] Invalid start/end for path planning: {start_cell} -> {end_cell}")
+                if self.sim and self.sim.pathfinder.is_loaded:
+                    nav_path = self.get_shortest_path(self.robot_location, next_waypoint)
+                    if nav_path:
+                        path_coords_list = nav_path
+                    else:
+                        return -1.0
+                else:
+                    return -1.0
+            else:
+                path = get_grid_path(self.robot_belief, start_cell, end_cell)
+                if path is None:
+                    print(f"[HabitatEnv] Path planning failed to {next_waypoint}. Obstacle detected or unreachable.")
+                    return -0.1
+                for cell in path:
+                    coord = get_coords_from_cell_position(np.array(cell), self.belief_info)
+                    path_coords_list.append(coord)
             
         # 2. Execute Path (Simulate movement)
-        # Move along path with subsampling (e.g., every 2 pixels ~= 0.8m)
-        step_size = 2 
+        # Move along path with subsampling (e.g., every 0.8m or similar)
+        # Grid path is dense (pixel by pixel). NavMesh path is sparse (waypoints).
         
-        # Skip start, iterate through path
-        for i in range(step_size, len(path), step_size):
-            target_cell = path[i]
-            target_coords = get_coords_from_cell_position(np.array(target_cell), self.belief_info)
-            target_pos_3d = np.array([target_coords[0], height, target_coords[1]])
-            
-            self._move_and_update(target_pos_3d)
-            
-        # Final move to ensure exact target
-        if len(path) > 0:
-            target_coords = get_coords_from_cell_position(np.array(path[-1]), self.belief_info)
-            target_pos_3d = np.array([target_coords[0], height, target_coords[1]])
-            self._move_and_update(target_pos_3d)
+        if path is not None:
+            # Dense grid path: subsample
+            step_size = 2 
+            for i in range(step_size, len(path_coords_list), step_size):
+                target_coords = path_coords_list[i]
+                target_pos_3d = np.array([target_coords[0], height, target_coords[1]])
+                self._move_and_update(target_pos_3d)
+                
+            # Final point
+            if len(path_coords_list) > 0:
+                target_coords = path_coords_list[-1]
+                target_pos_3d = np.array([target_coords[0], height, target_coords[1]])
+                self._move_and_update(target_pos_3d)
+        else:
+            prev = self.robot_location.copy()
+            for target_coords in path_coords_list:
+                seg = np.array(target_coords) - prev
+                dist = np.linalg.norm(seg)
+                if dist < 2.0:
+                    stride = float(self.mapper.cell_size)
+                else:
+                    stride = 0.8
+                steps = max(1, int(dist / stride))
+                for s in range(1, steps + 1):
+                    inter = prev + (s / steps) * seg
+                    target_pos_3d = np.array([inter[0], height, inter[1]])
+                    self._move_and_update(target_pos_3d)
+                prev = np.array(target_coords)
 
         # 3. Auxiliary Updates
-        if self.episode_index % 5 == 0: 
-            self.update_frontiers()
+        # Update frontiers on every step to keep utility fresh
+        self.update_frontiers()
         self.discover_stairs()
 
         # 4. Calculate Reward
@@ -479,14 +528,28 @@ class HabitatEnv:
         
         return 0.0
 
+    def get_grid_path_check(self, start_pos, end_pos):
+        """
+        Quickly check if a path exists between two points on the belief map.
+        Returns True if path exists, False otherwise.
+        """
+        start_cell = get_cell_position_from_coords(start_pos, self.belief_info)
+        end_cell = get_cell_position_from_coords(end_pos, self.belief_info)
+        
+        if start_cell is None or end_cell is None:
+            return False
+            
+        path = get_grid_path(self.robot_belief, start_cell, end_cell)
+        return path is not None
+
     def get_shortest_path(self, start_pos, end_pos):
         """
-        Computes the shortest path between two points on the NavMesh.
-        Args:
-            start_pos: (x, y) 2D coordinates
-            end_pos: (x, y) 2D coordinates
-        Returns:
-            List of (x, y) points representing the path, or None if no path found.
+        Computes the shortest path on the Physical Network (NavMesh).
+        
+        This method uses Habitat-Sim's PathFinder (the "Physical Network") to calculate
+        the true geodesic distance and path between two points. This serves as the 
+        ground truth for movement and is used as a fallback when the high-level 
+        topological graph fails.
         """
         if not self.sim or not self.sim.pathfinder.is_loaded:
             return None
@@ -514,6 +577,29 @@ class HabitatEnv:
             path_2d.append(np.array([p[0], p[2]]))
             
         return path_2d
+    
+    def get_shortest_path_with_distance(self, start_pos, end_pos):
+        if not self.sim or not self.sim.pathfinder.is_loaded:
+            return None, float('inf')
+        
+        agent_state = self.sim.get_agent(0).get_state()
+        height = agent_state.position[1]
+        
+        start_3d = np.array([start_pos[0], height, start_pos[1]])
+        end_3d = np.array([end_pos[0], height, end_pos[1]])
+        
+        sp = habitat_sim.ShortestPath()
+        sp.requested_start = start_3d
+        sp.requested_end = end_3d
+        
+        found = self.sim.pathfinder.find_path(sp)
+        if not found:
+            return None, float('inf')
+        
+        path_2d = []
+        for p in sp.points:
+            path_2d.append(np.array([p[0], p[2]]))
+        return path_2d, float(sp.geodesic_distance)
 
     def is_valid_location(self, coords_2d):
         """
@@ -595,8 +681,14 @@ class HabitatEnv:
         print(f"Switching floor in Habitat from Floor {self.floor_id}...")
         
         # 1. Update Floor ID
+        # Save current floor map state
+        if hasattr(self, 'mapper'):
+            try:
+                self.floor_states[self.floor_id] = self.mapper.get_state()
+            except Exception:
+                pass
         self.floor_id = 1 - self.floor_id # Toggle between 0 and 1
-        
+
         # 2. Teleport Agent to new floor height
         # Assuming Skokloster Castle or similar has floors at different heights
         # We need to find a safe navigable point on the new floor.
@@ -633,6 +725,39 @@ class HabitatEnv:
         self.sim.get_agent(0).set_state(new_state)
         
         print(f"Agent teleported to Floor {self.floor_id}, Height: {target_pos[1]:.2f}")
+        
+        # Update Ground Truth for the new floor height
+        try:
+            self.update_ground_truth_for_floor(height=target_pos[1])
+        except Exception:
+            pass
+        
+        # 3. Restore map for target floor if we have visited before; otherwise reset
+        if self.floor_id in self.floor_states:
+            print(f"[HabitatEnv] Restoring belief map for Floor {self.floor_id}")
+            try:
+                self.mapper.set_state(self.floor_states[self.floor_id])
+            except Exception:
+                self.mapper.reset()
+        else:
+            self.mapper.reset()
+        
+        # 4. Refresh belief map at the new pose and sync state
+        try:
+            observations = self.sim.get_sensor_observations()
+            agent_state = self.sim.get_agent(0).get_state()
+            sensor_state = agent_state.sensor_states['depth_sensor']
+            self.robot_belief = self.mapper.update(observations['depth_sensor'], sensor_state, agent_state)
+            self.belief_info.update_map_info(self.robot_belief, self.mapper.origin_x, self.mapper.origin_y)
+            self.update_robot_location_from_sim(agent_state)
+            self.trajectory_x = [self.robot_location[0]]
+            self.trajectory_y = [self.robot_location[1]]
+            if 'color_sensor' in observations:
+                self.rgb_image = observations['color_sensor'][..., :3]
+            self.update_frontiers()
+            self.discover_stairs()
+        except Exception:
+            pass
 
     def block_stairs_entrance(self, stairs_cell):
         # Habitat 不需要手动阻塞楼梯入口，因为有物理碰撞
@@ -646,8 +771,12 @@ class HabitatEnv:
         if hasattr(self, 'belief_info'):
             self.belief_info.update_map_info(self.robot_belief, self.belief_origin_x, self.belief_origin_y)
         
-        self.global_frontiers = set()
+        self.global_frontiers = []
         self.explored_rate = 0
+        
+        # Reset trajectory to prevent old lines from persisting on new map
+        self.trajectory_x = [self.robot_location[0]]
+        self.trajectory_y = [self.robot_location[1]]
 
     def plot_env(self, step):
         if not self.plot:
@@ -660,13 +789,13 @@ class HabitatEnv:
         has_rgb = hasattr(self, 'rgb_image') and self.rgb_image is not None
         
         if has_rgb:
+            plt.figure(figsize=(18, 6))
+            # Subplot 1: Explored Map
+            plt.subplot(1, 3, 1)
+        else:
             plt.figure(figsize=(12, 6))
             # Subplot 1: Explored Map
             plt.subplot(1, 2, 1)
-        else:
-            plt.figure(figsize=(8, 8))
-            # Only Map
-            plt.gca()
 
         # ... (Map plotting logic remains similar)
         
@@ -726,12 +855,74 @@ class HabitatEnv:
 
         # Subplot 2: RGB View (Agent Perspective) - Only if RGB exists
         if has_rgb:
-             plt.subplot(1, 2, 2)
+             plt.subplot(1, 3, 2)
              plt.imshow(self.rgb_image)
              plt.title('Agent View (RGB)')
              plt.axis('off')
+             
+             # Subplot 3: Ground Truth Map
+             plt.subplot(1, 3, 3)
+             gt_map_disp = np.zeros((*self.ground_truth.shape, 3), dtype=np.uint8)
+             # Use same colors as belief map for consistency
+             gt_mask_free = (self.ground_truth > 200)
+             gt_mask_occupied = (self.ground_truth < 50)
+             
+             gt_map_disp[gt_mask_free] = [255, 255, 255] # White
+             gt_map_disp[gt_mask_occupied] = [0, 0, 0]   # Black
+             gt_map_disp[~gt_mask_free & ~gt_mask_occupied] = [127, 127, 127] # Gray
+             
+             plt.imshow(gt_map_disp, origin='lower')
+             plt.title('Ground Truth Map (Real)')
+             plt.axis('off')
+             
+             # Plot robot on GT map too for reference
+             if hasattr(self, 'mapper'):
+                rx = (self.robot_location[0] - self.belief_origin_x) / self.mapper.cell_size
+                ry = (self.robot_location[1] - self.belief_origin_y) / self.mapper.cell_size
+                plt.plot(rx, ry, 'mo', markersize=6, markeredgecolor='k', zorder=10)
 
-        plt.suptitle(f'Explored: {self.explored_rate:.1%} | Dist: {self.travel_dist:.1f}m | Step: {step}', fontsize=14)
+        else:
+             # Subplot 2: Ground Truth Map (if no RGB)
+             plt.subplot(1, 2, 2)
+             gt_map_disp = np.zeros((*self.ground_truth.shape, 3), dtype=np.uint8)
+             gt_mask_free = (self.ground_truth > 200)
+             gt_mask_occupied = (self.ground_truth < 50)
+             
+             gt_map_disp[gt_mask_free] = [255, 255, 255] # White
+             gt_map_disp[gt_mask_occupied] = [0, 0, 0]   # Black
+             gt_map_disp[~gt_mask_free & ~gt_mask_occupied] = [127, 127, 127] # Gray
+             
+             plt.imshow(gt_map_disp, origin='lower')
+             plt.title('Ground Truth Map (Real)')
+             plt.axis('off')
+             
+             if hasattr(self, 'mapper'):
+                rx = (self.robot_location[0] - self.belief_origin_x) / self.mapper.cell_size
+                ry = (self.robot_location[1] - self.belief_origin_y) / self.mapper.cell_size
+                plt.plot(rx, ry, 'mo', markersize=6, markeredgecolor='k', zorder=10)
+
+        consistency_text = ""
+        try:
+            if hasattr(self, "ground_truth") and self.ground_truth is not None and self.ground_truth.shape == self.robot_belief.shape:
+                belief = self.robot_belief.astype(np.uint8)
+                gt = self.ground_truth.astype(np.uint8)
+                belief_free = belief > 200
+                belief_occ = belief < 50
+                belief_known = belief_free | belief_occ
+                gt_free = gt > 200
+                gt_occ = gt < 50
+                valid = belief_known & (gt_free | gt_occ)
+                denom = int(np.count_nonzero(valid))
+                if denom > 0:
+                    correct = (belief_free & gt_free) | (belief_occ & gt_occ)
+                    acc = float(np.count_nonzero(correct & valid)) / float(denom)
+                    ff = float(np.count_nonzero((belief_free & gt_occ) & valid)) / float(denom)
+                    fo = float(np.count_nonzero((belief_occ & gt_free) & valid)) / float(denom)
+                    consistency_text = f" | MapAcc: {acc:.1%} | FalseFree: {ff:.1%} | FalseOcc: {fo:.1%}"
+        except Exception:
+            consistency_text = ""
+
+        plt.suptitle(f'Explored: {self.explored_rate:.1%} | Dist: {self.travel_dist:.1f}m | Step: {step}{consistency_text}', fontsize=14)
         plt.tight_layout()
         
         # Ensure gifs_path exists

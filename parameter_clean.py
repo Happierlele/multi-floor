@@ -29,7 +29,8 @@ MIN_UTILITY = 2
 UPDATING_MAP_SIZE = 4 * SENSOR_RANGE + 4 * NODE_RESOLUTION
 
 # training parameters
-MAX_EPISODE_STEP = 256
+# Increase episode horizon to allow finishing one floor in a single run
+MAX_EPISODE_STEP = 1024
 REPLAY_SIZE = 10000
 MINIMUM_BUFFER_SIZE = 1000 # Reduced to match BATCH_SIZE to trigger training immediately after one episode
 BATCH_SIZE = 128

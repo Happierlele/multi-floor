@@ -7,22 +7,16 @@ import heapq
 from parameter_clean import *
 
 
-def get_frontier_in_map(map_info, robot_location=None):
+def get_frontier_in_map(map_info, location=None):
     """
     Extract global frontiers from the occupancy map.
     Frontiers are boundaries between FREE space and UNKNOWN space.
-    If robot_location is provided, only returns frontiers connected to the robot.
     """
     map_data = map_info.map
     # Free: > 200, Unknown: ~127 (100-150), Occupied: < 50
     
-    if robot_location is not None:
-        # Use connected free space only
-        free_mask = get_free_and_connected_map(robot_location, map_info)
-    else:
-        # Fallback to simple threshold
-        free_mask = (map_data > 200)
-        
+    # Binary masks
+    free_mask = (map_data > 200)
     unknown_mask = (map_data > 100) & (map_data < 150)
     
     # Dilate free space to find overlap with unknown
@@ -48,10 +42,24 @@ def get_cell_position_from_coords(coords, map_info, check_negative=True):
         return np.empty((0, 2), dtype=int)
     coords = np.array(coords)
     single_cell = False
-    if coords.flatten().shape[0] == 2:
-        single_cell = True
+    
+    # Robust handling for 2D/3D coordinates
+    if coords.ndim == 1:
+        if coords.shape[0] >= 2:
+            coords = coords[:2].reshape(1, 2)
+            single_cell = True
+    elif coords.ndim == 2:
+        if coords.shape[1] >= 2:
+            coords = coords[:, :2]
 
-    coords = coords.reshape(-1, 2)
+    # Fallback/Safety check
+    if coords.shape[1] != 2:
+        # Try reshaping if it was flattened 2D array
+        try:
+             coords = coords.reshape(-1, 2)
+        except:
+             return np.empty((0, 2), dtype=int)
+
     coords_x = coords[:, 0]
     coords_y = coords[:, 1]
     cell_x = ((coords_x - map_info.map_origin_x) / map_info.cell_size)
@@ -255,16 +263,17 @@ def get_grid_path(map_data, start, end, free_thresh=100):
             neighbor = (nx, ny)
             
             if 0 <= nx < cols and 0 <= ny < rows:
-                # Check traversability
-                # Allow Unknown (127) and Free (255). Block Occupied (0).
-                # Actually, strictly allowing only Free might be too restrictive initially.
-                # But for safe navigation, we should avoid Obstacles (<100).
-                if map_data[ny, nx] < free_thresh:
+                cell = map_data[ny, nx]
+                if cell < 100:
                     continue
-                
-                # Cost: 1.0 for cardinal, 1.414 for diagonal
-                dist = 1.414 if dx!=0 and dy!=0 else 1.0
-                tentative_g = g_score[current] + dist
+                base = 1.414 if dx!=0 and dy!=0 else 1.0
+                terrain = 1.0 if cell >= 200 else 3.0
+                penalty = 0.0
+                if nx-1 >= 0 and map_data[ny, nx-1] < 100: penalty += 2.0
+                if nx+1 < cols and map_data[ny, nx+1] < 100: penalty += 2.0
+                if ny-1 >= 0 and map_data[ny-1, nx] < 100: penalty += 2.0
+                if ny+1 < rows and map_data[ny+1, nx] < 100: penalty += 2.0
+                tentative_g = g_score[current] + base * terrain + penalty
                 
                 if neighbor not in g_score or tentative_g < g_score[neighbor]:
                     came_from[neighbor] = current

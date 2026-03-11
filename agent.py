@@ -86,8 +86,7 @@ class Agent:
             pass
 
     def update_frontiers(self):
-        # Use robot location to find connected frontiers only
-        self.frontier = get_frontier_in_map(self.updating_map_info, self.location)
+        self.frontier = get_frontier_in_map(self.updating_map_info)
 
     def update_graph(self, location, floor_id=0):
         self.node_manager.update_graph(location,

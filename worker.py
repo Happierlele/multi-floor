@@ -42,7 +42,7 @@ class Worker:
             import os
             # 优先使用传入的参数，否则使用环境变量
             # 注意：如果你用的是阿里云千问，请务必填入正确的 QWEN_API_KEY
-            key = vlm_api_key or os.getenv("QWEN_API_KEY") or "sk-fd3a29d3e96c43b9905c8bbdb36d3f48" 
+            key = vlm_api_key or os.getenv("QWEN_API_KEY")
             
             # 阿里云千问的 OpenAI 兼容接口地址
             # 注意：您的 Key 是在新加坡区(ap-southeast-1)创建的，需要使用国际版地址
@@ -50,8 +50,13 @@ class Worker:
             default_base = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" # 国际版
             base = vlm_base_url or os.getenv("QWEN_BASE_URL") or default_base
             
-            print(f"[Worker] Initializing VLM with Key: {key[:6]}...{key[-4:]}, Base URL: {base}")
-            self.vlm = VLMAdapter(model_name=vlm_model_name, api_key=key, base_url=base)
+            if not key:
+                print("[Worker] QWEN_API_KEY not set. Disabling VLM.", flush=True)
+                self.use_vlm = False
+                self.vlm = None
+            else:
+                print(f"[Worker] Initializing VLM with Key: {key[:6]}...{key[-4:]}, Base URL: {base}")
+                self.vlm = VLMAdapter(model_name=vlm_model_name, api_key=key, base_url=base)
 
         self.episode_buffer = []
         self.perf_metrics = dict()

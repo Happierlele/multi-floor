@@ -13,6 +13,8 @@ class VLMAdapter:
         self.provider = self._infer_provider(model_name)
         self.client = None
         self.use_legacy_openai = False
+        self._last_single_candidate = None
+        self._single_repeat_count = 0
         
         if self.provider in ("openai", "qwen"):
             import os
@@ -53,16 +55,140 @@ class VLMAdapter:
             except Exception:
                 self.client = None
 
-    def get_vlm_action(self, agent, observation, stairs_coords=None, rgb_image=None, debug_save_path=None):
+    def get_vlm_action(self, agent, observation, stairs_coords=None, rgb_image=None, debug_save_path=None, position_history=None, current_floor=None):
         """
         使用 VLM 的逻辑替换 agent.select_next_waypoint。
         rgb_image: Optional 3D first-person view from Habitat (numpy array)
         debug_save_path: Optional path to save the rendered visualization for debugging
+        position_history: List of previous positions (tuples or lists) to avoid ping-pong loops
+        current_floor: Optional floor ID to filter history by floor
         """
         candidate_indices = agent.neighbor_indices
-        candidate_indices = np.array([idx for idx in candidate_indices if idx != agent.current_index])
+        current_index = getattr(agent, "current_index", None)
+        if current_index is not None:
+            candidate_indices = np.array([idx for idx in candidate_indices if idx != current_index])
+        else:
+            candidate_indices = np.array(candidate_indices)
         if candidate_indices.size == 0:
             candidate_indices = np.array(agent.neighbor_indices)
+
+        # --- Filter out recently visited nodes (Anti-Ping-Pong) ---
+        if position_history and len(position_history) > 1 and candidate_indices.size > 0:
+             # Get recent positions (last 10 steps, EXCLUDING current position to allow moving away)
+             # Current position is typically the last element in position_history
+             recent_positions = position_history[:-1][-10:]
+             
+             # Calculate "last seen step" for each candidate
+             # We want to prefer candidates that were NOT seen, or seen longest ago.
+             candidate_last_seen = {}
+             candidate_visit_counts = {} # Also check global visit counts if possible
+
+             # Try to access node manager for global visit counts
+             node_manager = getattr(agent, "node_manager", None)
+             
+             for idx in candidate_indices:
+                 coords = agent.node_coords[idx]
+                 p1 = coords[:2] if len(coords) >= 2 else coords
+                 
+                 # Check global visit count
+                 visit_count = 0
+                 if node_manager:
+                     key = (round(float(p1[0]), 1), round(float(p1[1]), 1))
+                     node = node_manager.nodes_dict.find(key)
+                     if node:
+                         visit_count = node.data.visit_count
+                 candidate_visit_counts[idx] = visit_count
+
+                 last_seen = -1 # Never seen
+                 # Check against history (newest is last in list)
+                 for i, h_pos in enumerate(recent_positions):
+                     p2 = np.array(h_pos)[:2]
+                     
+                     # Check floor if provided and available in history
+                     match_floor = True
+                     if current_floor is not None and len(h_pos) > 2:
+                         if h_pos[2] != current_floor:
+                             match_floor = False
+
+                     if match_floor and np.linalg.norm(p1 - p2) < 1.0:
+                         last_seen = i # Store index (0=oldest in window, len-1=newest)
+                 
+                 candidate_last_seen[idx] = last_seen
+             
+             # Filter 1: Keep only candidates that were NOT seen in recent history
+             filtered_indices = [idx for idx in candidate_indices if candidate_last_seen[idx] == -1]
+             
+             # Filter 2: Among remaining candidates, prefer LOW visit counts
+             if len(filtered_indices) > 0:
+                 # Sort by visit count
+                 filtered_indices.sort(key=lambda idx: candidate_visit_counts.get(idx, 0))
+                 
+                 # If we have multiple candidates with LOW visits (e.g. 0 or 1), keep only those
+                 min_visits = candidate_visit_counts.get(filtered_indices[0], 0)
+                 best_indices = [idx for idx in filtered_indices if candidate_visit_counts.get(idx, 0) <= min_visits + 1] # Allow small margin
+                 
+                 candidate_indices = np.array(best_indices)
+                 print(f"[VLMAdapter] Filtered out recently visited & high-visit nodes. Remaining candidates: {len(candidate_indices)} (Min visits: {min_visits})")
+             else:
+                fallback_sorted = sorted(
+                    list(candidate_indices),
+                    key=lambda idx: (candidate_last_seen.get(idx, 10**9), candidate_visit_counts.get(idx, 0)),
+                )
+                chosen_idx = int(fallback_sorted[0]) if fallback_sorted else None
+                if chosen_idx is None:
+                    return (None, torch.tensor([[0]]).long())
+                candidate_indices = np.array([chosen_idx], dtype=int)
+                print(f"[VLMAdapter] All candidates were recently visited. Falling back to least-recent candidate: {chosen_idx}")
+        # ---------------------------------------------------------
+
+        if not hasattr(agent, "node_manager") or agent.node_manager is None or not hasattr(agent.node_manager, "nodes_dict"):
+            candidate_indices = np.array(candidate_indices[: min(10, len(candidate_indices))], dtype=int)
+            image_bytes = self.render_map_with_candidates(agent, candidate_indices, stairs_coords, rgb_image=rgb_image, current_floor=current_floor)
+            if debug_save_path:
+                try:
+                    img = Image.open(io.BytesIO(image_bytes))
+                    img.save(debug_save_path)
+                    print(f"[VLMAdapter] Saved debug visualization to {debug_save_path}")
+                except Exception as e:
+                    print(f"[VLMAdapter] Failed to save debug image: {e}")
+
+            prompt = self.construct_hierarchical_prompt(len(candidate_indices), has_3d_image=(rgb_image is not None))
+            decision_idx = 0
+            try:
+                print(f"[VLMAdapter] Calling VLM API with {len(candidate_indices)} candidates...")
+                response_text = self.call_vlm_api(image_bytes, prompt)
+                print(f"[VLMAdapter] Raw VLM Response: {response_text}")
+                decision_idx = self.parse_response(response_text, len(candidate_indices))
+            except Exception as e:
+                print(f"VLM query failed: {e}. Defaulting to heuristic.")
+                decision_idx = 0
+
+            action_index = int(candidate_indices[decision_idx])
+            next_location = agent.node_coords[action_index]
+            return (
+                next_location,
+                torch.tensor([[action_index]]).long()
+            )
+
+        if candidate_indices.size > 0:
+            coords_arr = np.array([agent.node_coords[int(i)] for i in candidate_indices])
+            mask = np.linalg.norm(coords_arr - agent.location, axis=1) > 0.1
+            candidate_indices = candidate_indices[mask]
+        if candidate_indices.size == 0:
+            return (None, torch.tensor([[0]]).long())
+        if candidate_indices.size == 1:
+            single_idx = int(candidate_indices[0])
+            coords = agent.node_coords[single_idx]
+            if self._last_single_candidate is not None and np.linalg.norm(np.array(self._last_single_candidate) - np.array(coords)) < 0.5:
+                self._single_repeat_count += 1
+            else:
+                self._single_repeat_count = 0
+            self._last_single_candidate = coords
+            if self._single_repeat_count >= 2:
+                print(f"[VLMAdapter] Single candidate repeated. Returning NONE to trigger random jump fallback.")
+                return (None, torch.tensor([[0]]).long())
+            print(f"[VLMAdapter] Only 1 candidate available: {single_idx} at {coords}")
+            return (coords, torch.tensor([[single_idx]]).long())
 
         scores = []
         valid_indices = []
@@ -108,7 +234,7 @@ class VLMAdapter:
             candidate_indices = np.array(agent.neighbor_indices)
 
         # 2. 渲染带有候选节点标记的地图
-        image_bytes = self.render_map_with_candidates(agent, candidate_indices, stairs_coords, rgb_image=rgb_image)
+        image_bytes = self.render_map_with_candidates(agent, candidate_indices, stairs_coords, rgb_image=rgb_image, position_history=position_history, current_floor=current_floor)
         
         # Debug: Save the image if path is provided
         if debug_save_path:
@@ -142,7 +268,7 @@ class VLMAdapter:
             torch.tensor([[action_index]]).long()
         )
 
-    def render_map_with_candidates(self, agent, candidate_indices, stairs_coords=None, rgb_image=None):
+    def render_map_with_candidates(self, agent, candidate_indices, stairs_coords=None, rgb_image=None, position_history=None, current_floor=0):
         """
         生成当前信念地图的图像，包含机器人和编号的候选节点。
         如果提供了 rgb_image (3D 视图)，则将其与地图并排显示。
@@ -170,6 +296,28 @@ class VLMAdapter:
             if len(frontier_coords) > 0:
                 frontier_cells = get_cell_position_from_coords(frontier_coords, agent.map_info).reshape(-1, 2)
                 ax_map.scatter(frontier_cells[:, 0], frontier_cells[:, 1], c='green', s=10, marker='.', label='Frontiers', zorder=3)
+        
+        # 绘制历史轨迹 (History Trajectory) - CYAN line
+        # Use passed position_history if available, otherwise check agent
+        hist = position_history if position_history is not None else getattr(agent, 'position_history', [])
+        
+        if hist:
+            # Filter history by current floor if needed
+            # Assuming history stores (x, y, floor) or just (x, y)
+            hist_points = []
+            # Use passed current_floor
+            
+            for p in hist:
+                if len(p) >= 3 and p[2] != current_floor:
+                    continue
+                hist_points.append(p[:2])
+                
+            if len(hist_points) > 1:
+                hist_arr = np.array(hist_points)
+                hist_cells = get_cell_position_from_coords(hist_arr, agent.map_info).reshape(-1, 2)
+                # Plot faint line
+                ax_map.plot(hist_cells[:, 0], hist_cells[:, 1], c='cyan', linewidth=2, alpha=0.6, label='History', zorder=2)
+                # Plot end point (current loc) is already done by Red Star
 
         # 绘制机器人 - RED star
         robot_cell = get_cell_position_from_coords(agent.location, agent.map_info)
@@ -218,6 +366,7 @@ I will show you a top-down map of your current surroundings.
 - The RED star indicates your current location.
 - The BLUE circles with numbers (0 to {num_candidates-1}) are reachable candidate waypoints.
 - The GREEN dots are unexplored frontiers (areas you haven't seen yet).
+- The CYAN line traces your recent path (History). AVOID going back to areas covered by the cyan line unless necessary.
 - The YELLOW star (if present) indicates a known stair location leading to another floor.
 """
         if has_3d_image:
