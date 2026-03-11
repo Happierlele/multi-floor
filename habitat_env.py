@@ -77,7 +77,7 @@ class HabitatEnv:
         h, w = self.robot_belief.shape
         self.belief_origin_x = origin_x
         self.belief_origin_y = origin_y
-        self.belief_info = MapInfo(self.robot_belief, self.belief_origin_x, self.belief_origin_y, CELL_SIZE)
+        self.belief_info = MapInfo(self.robot_belief, self.belief_origin_x, self.belief_origin_y, CELL_SIZE, vlm_rgb_map=self.mapper.get_vlm_rgb_map())
         
         # Ground Truth 信息在真实探索中是不可知的，但在仿真中我们可以获取
         # 使用 PathFinder 生成真实的 TopDown Map
@@ -107,8 +107,11 @@ class HabitatEnv:
         if 'habitat_sim' not in globals(): return None # 以此避免未安装时的崩溃
         
         sim_cfg = habitat_sim.SimulatorConfiguration()
-        # Use Matterport3D example scene (17DRP5sb8fy) as default
-        sim_cfg.scene_id = "data/scene_datasets/scene_datasets/mp3d_example/17DRP5sb8fy/17DRP5sb8fy.glb"
+        scene_id = os.environ.get("HABITAT_SCENE_ID", "").strip()
+        if scene_id:
+            sim_cfg.scene_id = scene_id
+        else:
+            sim_cfg.scene_id = "data/scene_datasets/scene_datasets/mp3d_example/17DRP5sb8fy/17DRP5sb8fy.glb"
         # Force EGL or offscreen rendering
         # Use inferred physical device ID if available (from worker_habitat.py)
         sim_cfg.gpu_device_id = int(os.environ.get("HABITAT_DEVICE_ID", 0))
@@ -321,6 +324,7 @@ class HabitatEnv:
             agent_state = self.sim.get_agent(0).get_state()
             sensor_state = agent_state.sensor_states['depth_sensor']
             self.robot_belief = self.mapper.update(observations['depth_sensor'], sensor_state, agent_state)
+            self.belief_info.update_map_info(self.robot_belief, self.mapper.origin_x, self.mapper.origin_y, vlm_rgb_map=self.mapper.get_vlm_rgb_map())
             self.update_robot_location_from_sim(agent_state)
             
             # Reset trajectory with new start position
@@ -413,7 +417,7 @@ class HabitatEnv:
         agent_state = self.sim.get_agent(0).get_state()
         sensor_state = agent_state.sensor_states['depth_sensor']
         self.robot_belief = self.mapper.update(observations['depth_sensor'], sensor_state, agent_state)
-        self.belief_info.update_map_info(self.robot_belief, self.mapper.origin_x, self.mapper.origin_y)
+        self.belief_info.update_map_info(self.robot_belief, self.mapper.origin_x, self.mapper.origin_y, vlm_rgb_map=self.mapper.get_vlm_rgb_map())
         self.update_robot_location_from_sim(agent_state)
         
         # Record trajectory at every micro-step for smooth visualization
@@ -748,7 +752,7 @@ class HabitatEnv:
             agent_state = self.sim.get_agent(0).get_state()
             sensor_state = agent_state.sensor_states['depth_sensor']
             self.robot_belief = self.mapper.update(observations['depth_sensor'], sensor_state, agent_state)
-            self.belief_info.update_map_info(self.robot_belief, self.mapper.origin_x, self.mapper.origin_y)
+            self.belief_info.update_map_info(self.robot_belief, self.mapper.origin_x, self.mapper.origin_y, vlm_rgb_map=self.mapper.get_vlm_rgb_map())
             self.update_robot_location_from_sim(agent_state)
             self.trajectory_x = [self.robot_location[0]]
             self.trajectory_y = [self.robot_location[1]]
@@ -769,7 +773,7 @@ class HabitatEnv:
             self.robot_belief = self.mapper.reset()
         
         if hasattr(self, 'belief_info'):
-            self.belief_info.update_map_info(self.robot_belief, self.belief_origin_x, self.belief_origin_y)
+            self.belief_info.update_map_info(self.robot_belief, self.belief_origin_x, self.belief_origin_y, vlm_rgb_map=self.mapper.get_vlm_rgb_map())
         
         self.global_frontiers = []
         self.explored_rate = 0

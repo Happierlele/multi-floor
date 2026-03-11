@@ -26,11 +26,17 @@ class SimpleMapper:
         self.global_map = np.ones((self.map_size_pixels, self.map_size_pixels), dtype=np.uint8) * 127
         self.free_count = np.zeros_like(self.global_map, dtype=np.float32)
         self.occ_count = np.zeros_like(self.global_map, dtype=np.float32)
+        self.occ_low_count = np.zeros_like(self.global_map, dtype=np.float32)
+        self.occ_mid_count = np.zeros_like(self.global_map, dtype=np.float32)
+        self.occ_high_count = np.zeros_like(self.global_map, dtype=np.float32)
 
     def reset(self):
         self.global_map.fill(127)
         self.free_count.fill(0.0)
         self.occ_count.fill(0.0)
+        self.occ_low_count.fill(0.0)
+        self.occ_mid_count.fill(0.0)
+        self.occ_high_count.fill(0.0)
         return self.global_map
     
     def get_state(self):
@@ -38,6 +44,9 @@ class SimpleMapper:
             'global_map': self.global_map.copy(),
             'free_count': self.free_count.copy(),
             'occ_count': self.occ_count.copy(),
+            'occ_low_count': self.occ_low_count.copy(),
+            'occ_mid_count': self.occ_mid_count.copy(),
+            'occ_high_count': self.occ_high_count.copy(),
             'origin_x': float(self.origin_x),
             'origin_y': float(self.origin_y),
             'cell_size': float(self.cell_size)
@@ -47,14 +56,39 @@ class SimpleMapper:
         gm = state.get('global_map', None)
         fc = state.get('free_count', None)
         oc = state.get('occ_count', None)
+        ol = state.get('occ_low_count', None)
+        om = state.get('occ_mid_count', None)
+        oh = state.get('occ_high_count', None)
         if gm is not None and gm.shape == self.global_map.shape:
             self.global_map = gm.copy()
         if fc is not None and fc.shape == self.free_count.shape:
             self.free_count = fc.copy()
         if oc is not None and oc.shape == self.occ_count.shape:
             self.occ_count = oc.copy()
+        if ol is not None and ol.shape == self.occ_low_count.shape:
+            self.occ_low_count = ol.copy()
+        if om is not None and om.shape == self.occ_mid_count.shape:
+            self.occ_mid_count = om.copy()
+        if oh is not None and oh.shape == self.occ_high_count.shape:
+            self.occ_high_count = oh.copy()
         self.origin_x = float(state.get('origin_x', self.origin_x))
         self.origin_y = float(state.get('origin_y', self.origin_y))
+
+    def get_vlm_rgb_map(self):
+        base = self.global_map.astype(np.uint8)
+        rgb = np.stack([base, base, base], axis=-1)
+        counts = np.stack([self.occ_low_count, self.occ_mid_count, self.occ_high_count], axis=-1)
+        idx = np.argmax(counts, axis=-1)
+        maxc = np.max(counts, axis=-1)
+        occ_mask = (base < 50) & (maxc > 1.0)
+        if np.any(occ_mask):
+            low = occ_mask & (idx == 0)
+            mid = occ_mask & (idx == 1)
+            high = occ_mask & (idx == 2)
+            rgb[low] = np.array([220, 20, 60], dtype=np.uint8)
+            rgb[mid] = np.array([255, 165, 0], dtype=np.uint8)
+            rgb[high] = np.array([138, 43, 226], dtype=np.uint8)
+        return rgb
 
     def _simulate_sensor_update(self, cx, cy, yaw, radius_meter, depth_obs=None):
         """简单的扇形更新，结合深度图"""
@@ -270,9 +304,10 @@ class SimpleMapper:
         # Ground Points (-0.5 ~ 0.2m)
         ground_mask = (y_local < 0.2) & (y_local > -0.5)
         
-        # Obstacle Points (0.25m ~ 1.5m) - Reduced max height from 2.0m to 1.5m
-        # This prevents ceiling lights or high wall features from cluttering the map.
-        obstacle_mask = (y_local >= 0.25) & (y_local < 1.5)
+        obstacle_low_mask = (y_local >= 0.25) & (y_local < 0.7)
+        obstacle_mid_mask = (y_local >= 0.7) & (y_local < 1.5)
+        obstacle_high_mask = (y_local >= 1.5) & (y_local < 3.0)
+        obstacle_mask = (y_local >= 0.25) & (y_local < 2.2)
 
         # DEBUG: Print stats if too few points
         # if np.sum(ground_mask) < 100 and np.sum(obstacle_mask) < 10:
@@ -420,6 +455,24 @@ class SimpleMapper:
             valid_o = (ox >= 0) & (ox < w_map) & (oy >= 0) & (oy < h_map)
             
             self.occ_count[oy[valid_o], ox[valid_o]] += 2.5
+        
+        if np.any(obstacle_low_mask):
+            o_pts = world_points[obstacle_low_mask]
+            ox, oy = points_to_indices(o_pts)
+            valid_o = (ox >= 0) & (ox < w_map) & (oy >= 0) & (oy < h_map)
+            self.occ_low_count[oy[valid_o], ox[valid_o]] += 1.0
+
+        if np.any(obstacle_mid_mask):
+            o_pts = world_points[obstacle_mid_mask]
+            ox, oy = points_to_indices(o_pts)
+            valid_o = (ox >= 0) & (ox < w_map) & (oy >= 0) & (oy < h_map)
+            self.occ_mid_count[oy[valid_o], ox[valid_o]] += 1.0
+
+        if np.any(obstacle_high_mask):
+            o_pts = world_points[obstacle_high_mask]
+            ox, oy = points_to_indices(o_pts)
+            valid_o = (ox >= 0) & (ox < w_map) & (oy >= 0) & (oy < h_map)
+            self.occ_high_count[oy[valid_o], ox[valid_o]] += 1.0
 
             
         # 5. 强制清除机器人自身位置 (Footprint Clearing)
@@ -427,8 +480,14 @@ class SimpleMapper:
         
         self.free_count *= 0.99
         self.occ_count *= 0.99
+        self.occ_low_count *= 0.99
+        self.occ_mid_count *= 0.99
+        self.occ_high_count *= 0.99
         np.clip(self.free_count, 0.0, 50.0, out=self.free_count)
         np.clip(self.occ_count, 0.0, 50.0, out=self.occ_count)
+        np.clip(self.occ_low_count, 0.0, 50.0, out=self.occ_low_count)
+        np.clip(self.occ_mid_count, 0.0, 50.0, out=self.occ_mid_count)
+        np.clip(self.occ_high_count, 0.0, 50.0, out=self.occ_high_count)
         diff = self.free_count - self.occ_count
         self.global_map[(diff > 0.8)] = 255
         self.global_map[(diff < -0.8)] = 0

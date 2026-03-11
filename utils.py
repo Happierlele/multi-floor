@@ -305,13 +305,16 @@ def make_gif(path, n, frame_files, rate):
 
 
 class MapInfo:
-    def __init__(self, map, map_origin_x, map_origin_y, cell_size):
+    def __init__(self, map, map_origin_x, map_origin_y, cell_size, vlm_rgb_map=None):
         self.map = map
         self.map_origin_x = map_origin_x
         self.map_origin_y = map_origin_y
         self.cell_size = cell_size
+        self.vlm_rgb_map = vlm_rgb_map
 
-    def update_map_info(self, map, map_origin_x, map_origin_y):
+    def update_map_info(self, map, map_origin_x, map_origin_y, vlm_rgb_map=None):
         self.map = map
         self.map_origin_x = map_origin_x
         self.map_origin_y = map_origin_y
+        if vlm_rgb_map is not None:
+            self.vlm_rgb_map = vlm_rgb_map

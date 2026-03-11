@@ -287,8 +287,11 @@ class VLMAdapter:
             ax_map = plt.gca()
         
         # --- 1. 绘制地图 (在 ax_map 上) ---
-        # 255=自由区域, 1=障碍物, 127=未知区域
-        ax_map.imshow(agent.map_info.map, cmap='gray', origin='upper')
+        map_img = getattr(agent.map_info, "vlm_rgb_map", None)
+        if map_img is not None:
+            ax_map.imshow(map_img, origin='upper')
+        else:
+            ax_map.imshow(agent.map_info.map, cmap='gray', origin='upper')
         
         # 绘制未知区域边界 (Frontiers) - GREEN dots
         if hasattr(agent, 'frontier') and agent.frontier:
@@ -368,6 +371,7 @@ I will show you a top-down map of your current surroundings.
 - The GREEN dots are unexplored frontiers (areas you haven't seen yet).
 - The CYAN line traces your recent path (History). AVOID going back to areas covered by the cyan line unless necessary.
 - The YELLOW star (if present) indicates a known stair location leading to another floor.
+- If obstacle cells are color-coded (not grayscale): they encode obstacle height (a z-layer hint). Prefer candidates that move toward useful height transitions (e.g., near stairs/ramps) when this floor is already well explored.
 """
         if has_3d_image:
             base_prompt += """
