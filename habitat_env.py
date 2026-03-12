@@ -3,13 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from copy import deepcopy
 
-# 尝试导入 habitat_sim (核心仿真器)
-import habitat_sim
-# try:
-#     import habitat_sim
-# except ImportError:
-#     print("Warning: habitat_sim not installed. HabitatEnv will not work.")
-#     print("Please follow instructions in habitat_migration_guide.md")
+habitat_sim = None
 
 # 尝试导入 habitat (High-level API, 可选)
 try:
@@ -104,7 +98,18 @@ class HabitatEnv:
 
     def _init_habitat(self):
         # 配置 Habitat
-        if 'habitat_sim' not in globals(): return None # 以此避免未安装时的崩溃
+        global habitat_sim
+        if habitat_sim is None:
+            if os.environ.get("DISPLAY", "") == "":
+                os.environ.setdefault("MAGNUM_TARGET_GLES", "1")
+                os.environ.setdefault("MAGNUM_TARGET_HEADLESS", "1")
+                os.environ.setdefault("MAGNUM_TARGET_EGL", "1")
+                os.environ.setdefault("EGL_PLATFORM", "device")
+                nvidia_json = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+                if os.path.exists(nvidia_json):
+                    os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", nvidia_json)
+            import habitat_sim as _habitat_sim
+            habitat_sim = _habitat_sim
         
         sim_cfg = habitat_sim.SimulatorConfiguration()
         scene_id = os.environ.get("HABITAT_SCENE_ID", "").strip()
