@@ -140,6 +140,12 @@ class HabitatEnv:
         depth_sensor_spec.sensor_type = habitat_sim.SensorType.DEPTH
         depth_sensor_spec.resolution = [480, 640]
         depth_sensor_spec.position = [0.0, 1.5, 0.0]
+        try:
+            hfov = float(os.environ.get("HABITAT_SENSOR_HFOV", "90"))
+            if hasattr(depth_sensor_spec, "hfov"):
+                depth_sensor_spec.hfov = hfov
+        except Exception:
+            pass
 
         # Add RGB Sensor for VLM
         rgb_sensor_spec = SensorSpecClass()
@@ -147,6 +153,12 @@ class HabitatEnv:
         rgb_sensor_spec.sensor_type = habitat_sim.SensorType.COLOR
         rgb_sensor_spec.resolution = [480, 640]
         rgb_sensor_spec.position = [0.0, 1.5, 0.0]
+        try:
+            hfov = float(os.environ.get("HABITAT_SENSOR_HFOV", "90"))
+            if hasattr(rgb_sensor_spec, "hfov"):
+                rgb_sensor_spec.hfov = hfov
+        except Exception:
+            pass
         
         agent_cfg.sensor_specifications = [depth_sensor_spec, rgb_sensor_spec]
         
@@ -260,30 +272,111 @@ class HabitatEnv:
         print(f"[HabitatEnv] Ground Truth updated for height {height:.2f}m", flush=True)
 
 
+    def _detect_stairs_from_navmesh(self, sample_points=4000, grid_size=1.0, height_bin=0.75, max_stairs=10):
+        if not self.sim or not self.sim.pathfinder.is_loaded:
+            return []
+
+        pts = []
+        for _ in range(int(sample_points)):
+            try:
+                p = self.sim.pathfinder.get_random_navigable_point()
+                if p is None:
+                    continue
+                pts.append([float(p[0]), float(p[1]), float(p[2])])
+            except Exception:
+                continue
+
+        if len(pts) < 200:
+            return []
+
+        pts = np.asarray(pts, dtype=np.float32)
+        y_bins = np.round(pts[:, 1] / float(height_bin)) * float(height_bin)
+        unique_bins, counts = np.unique(y_bins, return_counts=True)
+        if len(unique_bins) < 2:
+            return []
+
+        min_keep = max(50, int(0.03 * len(y_bins)))
+        keep_bins = set(unique_bins[counts >= min_keep].tolist())
+        if len(keep_bins) < 2:
+            keep_bins = set(unique_bins[counts.argsort()[::-1][:2]].tolist())
+
+        gx = np.floor(pts[:, 0] / float(grid_size)).astype(np.int32)
+        gz = np.floor(pts[:, 2] / float(grid_size)).astype(np.int32)
+
+        cell_bins = {}
+        cell_sum = {}
+        for i in range(pts.shape[0]):
+            b = float(y_bins[i])
+            if b not in keep_bins:
+                continue
+            key = (int(gx[i]), int(gz[i]))
+            if key not in cell_bins:
+                cell_bins[key] = {b}
+                cell_sum[key] = [pts[i, 0], pts[i, 2], 1]
+            else:
+                cell_bins[key].add(b)
+                s = cell_sum[key]
+                s[0] += pts[i, 0]
+                s[1] += pts[i, 2]
+                s[2] += 1
+
+        candidates = []
+        for key, bins in cell_bins.items():
+            if len(bins) >= 2:
+                sx, sz, n = cell_sum[key]
+                if n > 0:
+                    candidates.append([sx / n, sz / n])
+
+        if not candidates:
+            return []
+
+        selected = []
+        min_sep = float(grid_size) * 2.0
+        for c in candidates:
+            if len(selected) >= int(max_stairs):
+                break
+            if not selected:
+                selected.append(c)
+                continue
+            d2 = min((c[0] - s[0]) ** 2 + (c[1] - s[1]) ** 2 for s in selected)
+            if d2 >= (min_sep ** 2):
+                selected.append(c)
+
+        return selected[: int(max_stairs)]
+
+
     def _generate_stairs(self):
         """
-        Simulate stairs locations by picking random navigable points on the current floor.
-        NOTE: This is for testing multi-floor navigation logic on single-floor maps.
-        Real stairs should be detected from semantic annotations if available.
+        Generate stairs candidates. If multi-floor structure exists, detect likely vertical connectors from NavMesh samples.
         """
         self.stairs_coords_list = []
         self.discovered_stairs = set()
-        
-        # SIMULATION ONLY: Generate virtual stairs for testing
-        print("[HabitatEnv] NOTICE: Generating VIRTUAL/SIMULATED stairs for multi-floor logic testing.", flush=True)
-        num_stairs = 2
-        self.stairs_coords_list = [] # Initialize list
-        for _ in range(num_stairs):
-            try:
-                # Try to find a point somewhat far from robot? 
-                # For now just random navigable points
-                pt = self.sim.pathfinder.get_random_navigable_point()
-                # Convert to 2D coords
-                self.stairs_coords_list.append([pt[0], pt[2]])
-            except:
-                pass
-        
-        print(f"[HabitatEnv] Generated {len(self.stairs_coords_list)} simulated stairs locations.", flush=True)
+
+        try:
+            detected = self._detect_stairs_from_navmesh(
+                sample_points=int(os.environ.get("HABITAT_STAIRS_SAMPLE_POINTS", "4000")),
+                grid_size=float(os.environ.get("HABITAT_STAIRS_GRID_SIZE", "1.0")),
+                height_bin=float(os.environ.get("HABITAT_STAIRS_HEIGHT_BIN", "0.75")),
+                max_stairs=int(os.environ.get("HABITAT_STAIRS_MAX", "10")),
+            )
+        except Exception:
+            detected = []
+
+        if detected:
+            self.stairs_coords_list = [list(map(float, s)) for s in detected]
+            print(f"[HabitatEnv] Detected {len(self.stairs_coords_list)} stairs candidates from NavMesh.", flush=True)
+            return
+
+        if self.sim and self.sim.pathfinder.is_loaded:
+            num_stairs = 2
+            for _ in range(num_stairs):
+                try:
+                    pt = self.sim.pathfinder.get_random_navigable_point()
+                    self.stairs_coords_list.append([float(pt[0]), float(pt[2])])
+                except Exception:
+                    pass
+            if self.stairs_coords_list:
+                print(f"[HabitatEnv] Generated {len(self.stairs_coords_list)} fallback stairs points.", flush=True)
         return
 
     def discover_stairs(self):
@@ -360,8 +453,8 @@ class HabitatEnv:
                 self.rgb_image = None
                 print("[HabitatEnv] Warning: No color_sensor in observations!", flush=True)
         
-        # Generate new stairs for the episode
-        self._generate_stairs()
+        if self.sim and self.sim.pathfinder.is_loaded and not self.stairs_coords_list:
+            self._generate_stairs()
         
         return self.robot_belief
 
@@ -497,10 +590,19 @@ class HabitatEnv:
                 path = get_grid_path(self.robot_belief, start_cell, end_cell)
                 if path is None:
                     print(f"[HabitatEnv] Path planning failed to {next_waypoint}. Obstacle detected or unreachable.")
-                    return -0.1
-                for cell in path:
-                    coord = get_coords_from_cell_position(np.array(cell), self.belief_info)
-                    path_coords_list.append(coord)
+                    if self.sim and self.sim.pathfinder.is_loaded:
+                        nav_path = self.get_shortest_path(self.robot_location, next_waypoint)
+                        if nav_path:
+                            path = None
+                            path_coords_list = nav_path
+                        else:
+                            return -0.1
+                    else:
+                        return -0.1
+                if path is not None:
+                    for cell in path:
+                        coord = get_coords_from_cell_position(np.array(cell), self.belief_info)
+                        path_coords_list.append(coord)
             
         # 2. Execute Path (Simulate movement)
         # Move along path with subsampling (e.g., every 0.8m or similar)
@@ -578,13 +680,21 @@ class HabitatEnv:
         if not self.sim or not self.sim.pathfinder.is_loaded:
             return None
             
-        # Convert to 3D points (y is height)
-        # We use the agent's current height for start.
         agent_state = self.sim.get_agent(0).get_state()
-        height = agent_state.position[1]
+        height = float(agent_state.position[1])
         
-        start_3d = np.array([start_pos[0], height, start_pos[1]])
-        end_3d = np.array([end_pos[0], height, end_pos[1]])
+        start_guess = np.array([float(start_pos[0]), height, float(start_pos[1])], dtype=np.float32)
+        end_guess = np.array([float(end_pos[0]), height, float(end_pos[1])], dtype=np.float32)
+        
+        try:
+            start_3d = self.sim.pathfinder.snap_point(start_guess)
+            end_3d = self.sim.pathfinder.snap_point(end_guess)
+        except Exception:
+            start_3d = start_guess
+            end_3d = end_guess
+        
+        if np.isnan(start_3d[0]) or np.isnan(end_3d[0]):
+            return None
         
         path = habitat_sim.ShortestPath()
         path.requested_start = start_3d
@@ -595,7 +705,6 @@ class HabitatEnv:
         if not found:
             return None
             
-        # Convert path points back to 2D
         path_2d = []
         for p in path.points:
             path_2d.append(np.array([p[0], p[2]]))
@@ -607,10 +716,20 @@ class HabitatEnv:
             return None, float('inf')
         
         agent_state = self.sim.get_agent(0).get_state()
-        height = agent_state.position[1]
+        height = float(agent_state.position[1])
         
-        start_3d = np.array([start_pos[0], height, start_pos[1]])
-        end_3d = np.array([end_pos[0], height, end_pos[1]])
+        start_guess = np.array([float(start_pos[0]), height, float(start_pos[1])], dtype=np.float32)
+        end_guess = np.array([float(end_pos[0]), height, float(end_pos[1])], dtype=np.float32)
+        
+        try:
+            start_3d = self.sim.pathfinder.snap_point(start_guess)
+            end_3d = self.sim.pathfinder.snap_point(end_guess)
+        except Exception:
+            start_3d = start_guess
+            end_3d = end_guess
+        
+        if np.isnan(start_3d[0]) or np.isnan(end_3d[0]):
+            return None, float('inf')
         
         sp = habitat_sim.ShortestPath()
         sp.requested_start = start_3d
@@ -642,8 +761,14 @@ class HabitatEnv:
         # 2. Navigability Check
         if self.sim and self.sim.pathfinder.is_loaded:
             current_state = self.sim.get_agent(0).get_state()
-            height = current_state.position[1]
-            target_pos = np.array([coords_2d[0], height, coords_2d[1]])
+            height = float(current_state.position[1])
+            target_guess = np.array([float(coords_2d[0]), height, float(coords_2d[1])], dtype=np.float32)
+            try:
+                target_pos = self.sim.pathfinder.snap_point(target_guess)
+            except Exception:
+                target_pos = target_guess
+            if np.isnan(target_pos[0]):
+                return False
             return self.sim.pathfinder.is_navigable(target_pos)
             
         return True

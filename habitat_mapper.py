@@ -218,7 +218,8 @@ class SimpleMapper:
         # 确定地面高度
         floor_height = 0.0
         if agent_base_state is not None:
-            floor_height = agent_base_state.position[1]
+            floor_height = float(agent_base_state.position[1])
+            floor_height = round(floor_height / 0.25) * 0.25
         else:
             # 启发式: 假设相机高度约为 1.5m
             floor_height = sensor_pos[1] - 1.5
@@ -341,7 +342,7 @@ class SimpleMapper:
         # UPDATE: 0.5m threshold is too strict. It prevents clearing when looking at walls (blind spot for floor).
         # We need to allow clearing even if we hit a wall, otherwise the map remains grey in front of the robot.
         # Raising to 2.0m to ensure we clear space up to the walls we see.
-        clearing_mask = (y_local < 3.0)
+        clearing_mask = (y_local < 1.0)
         
         if np.sum(clearing_mask) > 0:
             clearing_points = world_points[clearing_mask]
@@ -478,21 +479,21 @@ class SimpleMapper:
         # 5. 强制清除机器人自身位置 (Footprint Clearing)
         self._clear_footprint(agent_base_state)
         
-        self.free_count *= 0.99
-        self.occ_count *= 0.99
-        self.occ_low_count *= 0.99
-        self.occ_mid_count *= 0.99
-        self.occ_high_count *= 0.99
+        self.free_count *= 0.995
+        self.occ_count *= 0.995
+        self.occ_low_count *= 0.995
+        self.occ_mid_count *= 0.995
+        self.occ_high_count *= 0.995
         np.clip(self.free_count, 0.0, 50.0, out=self.free_count)
         np.clip(self.occ_count, 0.0, 50.0, out=self.occ_count)
         np.clip(self.occ_low_count, 0.0, 50.0, out=self.occ_low_count)
         np.clip(self.occ_mid_count, 0.0, 50.0, out=self.occ_mid_count)
         np.clip(self.occ_high_count, 0.0, 50.0, out=self.occ_high_count)
         diff = self.free_count - self.occ_count
-        self.global_map[(diff > 0.8)] = 255
-        self.global_map[(diff < -0.8)] = 0
-        mid_mask = (diff >= -0.8) & (diff <= 0.8)
+        self.global_map[(diff > 0.4)] = 255
+        self.global_map[(diff < -0.4)] = 0
+        mid_mask = (diff >= -0.4) & (diff <= 0.4)
         conf = self.free_count + self.occ_count
-        self.global_map[mid_mask & (conf < 0.8)] = 127
+        self.global_map[mid_mask & (conf < 2.0)] = 127
         
         return self.global_map
