@@ -34,7 +34,21 @@ def get_frontier_in_map(map_info, location=None):
     frontier_coords = get_coords_from_cell_position(frontier_cells, map_info)
     
     # Return as set of tuples
-    return set(map(tuple, frontier_coords))
+    fc = np.asarray(frontier_coords)
+    if fc.size == 0:
+        return set()
+    if fc.ndim == 1:
+        if fc.shape[0] >= 2:
+            fc = fc[:2].reshape(1, 2)
+        else:
+            return set()
+    elif fc.ndim >= 2:
+        fc = fc.reshape(-1, fc.shape[-1])
+        if fc.shape[1] >= 2:
+            fc = fc[:, :2]
+        else:
+            return set()
+    return set(map(tuple, fc))
 
 
 def get_cell_position_from_coords(coords, map_info, check_negative=True):
@@ -99,8 +113,15 @@ def get_free_area_coords(map_info):
 
 def get_free_and_connected_map(location, map_info):
     # a binary map for free and connected areas
-    free = (map_info.map == FREE).astype(float)
-    labeled_free = label(free, connectivity=2)
+    try:
+        allow_unknown = int(os.environ.get("HABITAT_ASTAR_ALLOW_UNKNOWN", "0")) != 0
+    except Exception:
+        allow_unknown = False
+    if allow_unknown:
+        traversable = (map_info.map >= 100).astype(float)
+    else:
+        traversable = (map_info.map >= 200).astype(float)
+    labeled_free = label(traversable, connectivity=2)
     cell = get_cell_position_from_coords(location, map_info)
     
     # Safety check: if cell is out of bounds or not in free area
@@ -114,7 +135,7 @@ def get_free_and_connected_map(location, map_info):
             return connected_free_map
 
     # Fallback: Return all free areas if robot is somehow in obstacle/unknown
-    return free > 0
+    return traversable > 0
 
 
 def get_updating_node_coords(location, updating_map_info, check_connectivity=True):
@@ -141,12 +162,17 @@ def get_updating_node_coords(location, updating_map_info, check_connectivity=Tru
     free_connected_map = None
 
     if not check_connectivity:
+        try:
+            allow_unknown = int(os.environ.get("HABITAT_ASTAR_ALLOW_UNKNOWN", "0")) != 0
+        except Exception:
+            allow_unknown = False
+        thr = 100 if bool(allow_unknown) else 200
 
         indices = []
         nodes_cells = get_cell_position_from_coords(nodes, updating_map_info).reshape(-1, 2)
         for i, cell in enumerate(nodes_cells):
             assert 0 <= cell[1] < updating_map_info.map.shape[0] and 0 <= cell[0] < updating_map_info.map.shape[1]
-            if updating_map_info.map[cell[1], cell[0]] > 200:
+            if updating_map_info.map[cell[1], cell[0]] >= int(thr):
                 indices.append(i)
         indices = np.array(indices, dtype=int)
         nodes = nodes[indices].reshape(-1, 2)
@@ -240,6 +266,13 @@ def get_grid_path(map_data, start, end, free_thresh=100):
     
     visited = set()
     
+    try:
+        allow_unknown = int(os.environ.get("HABITAT_ASTAR_ALLOW_UNKNOWN", "0")) != 0
+    except Exception:
+        allow_unknown = False
+    if int(free_thresh) == 100 and (not allow_unknown):
+        free_thresh = 200
+
     while open_set:
         current_f, cx, cy = heapq.heappop(open_set)
         current = (cx, cy)
@@ -264,7 +297,7 @@ def get_grid_path(map_data, start, end, free_thresh=100):
             
             if 0 <= nx < cols and 0 <= ny < rows:
                 cell = map_data[ny, nx]
-                if cell < 100:
+                if cell < int(free_thresh):
                     continue
                 base = 1.414 if dx!=0 and dy!=0 else 1.0
                 terrain = 1.0 if cell >= 200 else 3.0
@@ -300,6 +333,12 @@ def make_gif(path, n, frame_files, rate):
 
     # Remove files
     for filename in frame_files[:-1]:
+        try:
+            base = os.path.basename(str(filename)).lower()
+        except Exception:
+            base = ""
+        if "stairs" in base:
+            continue
         if os.path.exists(filename):
             os.remove(filename)
 

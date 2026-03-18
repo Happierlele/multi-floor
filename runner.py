@@ -4,7 +4,13 @@ from parameter_clean import *
 # This ensures that EGL/GL environment variables and library preloading happen 
 # before Torch initializes CUDA or loads conflicting libraries.
 if USE_HABITAT:
-    from worker_habitat import Worker
+    import worker_habitat as _worker_habitat
+    Worker = getattr(_worker_habitat, "Worker", None)
+    if Worker is None:
+        raise ImportError(
+            f"worker_habitat imported from {_worker_habitat.__file__} but has no attribute 'Worker'. "
+            f"Top-level names: {sorted([k for k in _worker_habitat.__dict__.keys() if not k.startswith('_')])[:50]}"
+        )
 else:
     from worker import Worker
 
@@ -119,7 +125,73 @@ class RLRunner(Runner):
         if USE_HABITAT:
             try:
                 print(f"[RLRunner {meta_agent_id}] Initializing Persistent HabitatEnv...", flush=True)
-                from habitat_env import HabitatEnv
+                import importlib
+                import habitat_env as _habitat_env
+                HabitatEnv = getattr(_habitat_env, "HabitatEnv", None)
+                if HabitatEnv is None:
+                    try:
+                        _habitat_env = importlib.reload(_habitat_env)
+                    except Exception:
+                        pass
+                    HabitatEnv = getattr(_habitat_env, "HabitatEnv", None)
+                if HabitatEnv is None:
+                    try:
+                        import importlib.util
+                        hab_path = getattr(_habitat_env, "__file__", None) or "habitat_env.py"
+                        try:
+                            import os
+                            _hab_stat = None
+                            _hab_size = None
+                            _hab_head = None
+                            if os.path.exists(hab_path):
+                                _hab_stat = os.stat(hab_path)
+                                _hab_size = int(getattr(_hab_stat, "st_size", -1))
+                                try:
+                                    with open(hab_path, "r", encoding="utf-8", errors="replace") as f:
+                                        _hab_head = f.read(200)
+                                except Exception:
+                                    _hab_head = None
+                        except Exception:
+                            _hab_stat = None
+                            _hab_size = None
+                            _hab_head = None
+                        spec = importlib.util.spec_from_file_location(f"habitat_env_rlrunner_{meta_agent_id}", hab_path)
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        HabitatEnv = getattr(mod, "HabitatEnv", None)
+                    except Exception as e:
+                        keys = sorted([k for k in getattr(_habitat_env, "__dict__", {}).keys() if not k.startswith("_")])[:80]
+                        raise ImportError(
+                            f"Failed to load HabitatEnv from habitat_env ({getattr(_habitat_env, '__file__', 'unknown')}). "
+                            f"Top-level names: {keys}. "
+                            f"habitat_env.py size={_hab_size}, head={repr(_hab_head)}"
+                        ) from e
+                if HabitatEnv is None:
+                    keys = sorted([k for k in getattr(_habitat_env, "__dict__", {}).keys() if not k.startswith("_")])[:80]
+                    try:
+                        import os
+                        hab_path = getattr(_habitat_env, "__file__", None) or "habitat_env.py"
+                        _hab_stat = os.stat(hab_path) if os.path.exists(hab_path) else None
+                        _hab_size = int(getattr(_hab_stat, "st_size", -1)) if _hab_stat is not None else None
+                        try:
+                            with open(hab_path, "r", encoding="utf-8", errors="replace") as f:
+                                _hab_head = f.read(200)
+                        except Exception:
+                            _hab_head = None
+                    except Exception:
+                        hab_path = getattr(_habitat_env, "__file__", None)
+                        _hab_size = None
+                        _hab_head = None
+                    if _hab_size == 0:
+                        raise ImportError(
+                            f"habitat_env.py appears empty (size=0): {hab_path}. "
+                            f"This commonly happens after a failed sync/write (e.g., disk full). "
+                            f"Top-level names: {keys}. head={repr(_hab_head)}"
+                        )
+                    raise ImportError(
+                        f"habitat_env imported from {getattr(_habitat_env, '__file__', 'unknown')} but has no attribute 'HabitatEnv'. "
+                        f"Top-level names: {keys}. habitat_env.py size={_hab_size}, head={repr(_hab_head)}"
+                    )
                 # Initialize with dummy values, will be reset later via reset_episode
                 # This ensures EGL context is created and claimed before Torch
                 self.persistent_env = HabitatEnv(0, plot=True)

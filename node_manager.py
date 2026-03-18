@@ -68,10 +68,15 @@ class NodeManager:
 
         # Ensure robot is connected to the graph
         # If robot is far from all candidate nodes, add robot location as a node
+        robot_key = np.around(robot_location, 1)
         min_dist_to_candidates = float('inf')
         if len(node_coords) > 0:
-            dists = np.linalg.norm(node_coords - robot_location, axis=1)
-            min_dist_to_candidates = np.min(dists)
+            dists = np.linalg.norm(node_coords - robot_key, axis=1)
+            min_dist_to_candidates = float(np.min(dists))
+            if min_dist_to_candidates > 1.5:
+                node_coords = np.vstack([node_coords, robot_key])
+        else:
+            node_coords = np.array([robot_key])
         
         # Tighten threshold to 1.0m to prevent excessive off-grid node creation while maintaining connectivity
         off_grid_node = None
@@ -90,7 +95,7 @@ class NodeManager:
              min_dist_to_existing = np.linalg.norm(nearest_existing_node.coords - robot_location)
         
         if len(node_coords) == 0 and min_dist_to_existing == float('inf'):
-              node_coords = np.array([np.around(robot_location, 1)])
+              node_coords = np.array([robot_key])
         elif min_dist_to_existing <= 2.0 and nearest_existing_node is not None:
               # Snap to existing node (likely an off-grid node from previous step)
               # Ensure it is included in update list
@@ -121,7 +126,7 @@ class NodeManager:
             if node is None:
                 node = self.add_node_to_dict(coords, frontiers, updating_map_info, floor_id)
                 # Mark this node if it matches robot location (the off-grid node)
-                if np.array_equal(coords, robot_location):
+                if np.array_equal(np.around(coords, 1), robot_key):
                     off_grid_node = node
             else:
                 node = node.data
@@ -561,4 +566,3 @@ class Node:
     def set_visited(self):
         self.visited = 1
         self.visit_count += 1
-        self.observable_frontiers = set()

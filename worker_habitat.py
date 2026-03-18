@@ -26,6 +26,7 @@ print("[Worker] Env: GLES=1, HEADLESS=1, EGL=1, EGL_PLATFORM=device", flush=True
 os.environ["MAGNUM_LOG"] = "verbose"
 os.environ["GLOG_minloglevel"] = "0"
 os.environ["HABITAT_SIM_LOG"] = "verbose"
+os.environ["HABITAT_MAPPER_MODE"] = "3d"
 
 # FORCE NVIDIA DRIVER
 nvidia_json = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
@@ -60,7 +61,7 @@ print(f"[Worker] Using LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', '')}"
 
 # -------------------------------------------------------------------------
 # Imports that depend on the above configuration
-import habitat_sim # NOW it is safe to import
+habitat_sim = None
 import torch
 import matplotlib
 matplotlib.use('Agg') # Force headless backend for matplotlib
@@ -70,7 +71,6 @@ import numpy as np
 import quads
 from copy import deepcopy
 
-from habitat_env import HabitatEnv
 from agent import Agent
 from utils import *
 from model import PolicyNet, StairSwitchNet
@@ -78,8 +78,14 @@ from ground_truth_node_manager import GroundTruthNodeManager
 from vlm_adapter import VLMAdapter
 from parameter_clean import *
 
-if not os.path.exists(gifs_path):
-    os.makedirs(gifs_path)
+try:
+    if not os.path.exists(gifs_path):
+        os.makedirs(gifs_path)
+except OSError as e:
+    try:
+        print(f"[Worker] Warning: Failed to create gifs_path '{gifs_path}': {e}", flush=True)
+    except Exception:
+        pass
 
 
 class Worker:
@@ -98,6 +104,7 @@ class Worker:
             self.env.episode_index = global_step
             self.env.plot = False # Force disable plotting to prevent core dumps
         else:
+            from habitat_env import HabitatEnv
             self.env = HabitatEnv(0, plot=save_image) # Enable plotting if requested
             
         # Do not overwrite save_image to False
@@ -136,13 +143,38 @@ class Worker:
             key = vlm_api_key or os.getenv("QWEN_API_KEY")
             default_base = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" 
             base = vlm_base_url or os.getenv("QWEN_BASE_URL") or default_base
+            def _sanitize_base_url(u):
+                if u is None:
+                    return None
+                s = str(u).strip()
+                if (s.startswith(("`", "'", "\"")) and s.endswith(("`", "'", "\"")) and len(s) >= 2):
+                    s = s[1:-1].strip()
+                s = s.strip().strip("`").strip()
+                return s or None
+
+            def _sanitize_key(k):
+                if k is None:
+                    return None
+                s = str(k).strip()
+                if (s.startswith(("`", "'", "\"", "“", "‘")) and s.endswith(("`", "'", "\"", "”", "’")) and len(s) >= 2):
+                    s = s[1:-1].strip()
+                s = s.strip().strip("`").strip()
+                return s or None
+
+            base = _sanitize_base_url(base) or default_base
+            key = _sanitize_key(key)
             if not key:
                 print("[Worker] QWEN_API_KEY not set. Disabling VLM.", flush=True)
                 self.use_vlm = False
                 self.vlm = None
             else:
-                print(f"[Worker] Initializing VLM with Key: {key[:6]}...{key[-4:]}, Base URL: {base}")
+                print(f"[Worker] Initializing VLM (key_set=1, base_url={base})", flush=True)
                 self.vlm = VLMAdapter(model_name=vlm_model_name, api_key=key, base_url=base)
+                try:
+                    self.env.vlm = self.vlm
+                    self.env.use_vlm_stairs = True
+                except Exception:
+                    pass
 
         self.episode_buffer = []
         self.perf_metrics = dict()
@@ -266,36 +298,36 @@ class Worker:
         # But since we use random navigable points, let's just teleport to a random point
         # to simulate arriving at a new area.
         if self.env.sim and self.env.sim.pathfinder.is_loaded:
-             try:
-                 target_pos = self.env.sim.pathfinder.get_random_navigable_point()
-                 # Optional: Bias height?
-                 # target_pos[1] += 3.0 * self.env.floor_id 
-                 # (Only if mesh is actually multi-floor tall, otherwise we might go out of bounds)
-                 
-                 new_state = habitat_sim.AgentState()
-                 new_state.position = target_pos
-                 import quaternion
-                 angle = np.random.uniform(0, 2 * np.pi)
-                 new_state.rotation = quaternion.from_rotation_vector(np.array([0, angle, 0]))
-                 self.env.sim.get_agent(0).set_state(new_state)
-                 
-                 # Update env state
-                 obs = self.env.sim.get_sensor_observations()
-                 agent_state = self.env.sim.get_agent(0).get_state()
-                 self.env.robot_belief = self.env.mapper.reset() # Ensure mapper is clean
-                 self.env.robot_belief = self.env.mapper.update(obs['depth_sensor'], agent_state.sensor_states['depth_sensor'], agent_state)
-                 self.env.update_robot_location_from_sim(agent_state)
-                 
-                 print(f"[Worker] Teleported to new floor {self.env.floor_id} at {target_pos}", flush=True)
-                 
-                 # 5. Regenerate Ground Truth for the new floor
-                 # Use the robot's new height to slice the NavMesh
-                 self.env.update_ground_truth_for_floor(height=agent_state.position[1])
-                 
-                 # Add explicit graph connection (Stair Edge)
-                 self.robot.node_manager.add_stair_connection(old_floor_id, old_location, self.env.floor_id, self.env.robot_location)
-             except Exception as e:
-                 print(f"[Worker] Error during floor transition: {e}", flush=True)
+            try:
+                target_pos = self.env.sim.pathfinder.get_random_navigable_point()
+                # Optional: Bias height?
+                # target_pos[1] += 3.0 * self.env.floor_id 
+                # (Only if mesh is actually multi-floor tall, otherwise we might go out of bounds)
+                
+                new_state = self.env.sim.get_agent(0).get_state()
+                new_state.position = target_pos
+                import quaternion
+                angle = np.random.uniform(0, 2 * np.pi)
+                new_state.rotation = quaternion.from_rotation_vector(np.array([0, angle, 0]))
+                self.env.sim.get_agent(0).set_state(new_state)
+                
+                # Update env state
+                obs = self.env.sim.get_sensor_observations()
+                agent_state = self.env.sim.get_agent(0).get_state()
+                self.env.robot_belief = self.env.mapper.reset() # Ensure mapper is clean
+                self.env.robot_belief = self.env.mapper.update(obs['depth_sensor'], agent_state.sensor_states['depth_sensor'], agent_state)
+                self.env.update_robot_location_from_sim(agent_state)
+                
+                print(f"[Worker] Teleported to new floor {self.env.floor_id} at {target_pos}", flush=True)
+                
+                # 5. Regenerate Ground Truth for the new floor
+                # Use the robot's new height to slice the NavMesh
+                self.env.update_ground_truth_for_floor(height=agent_state.position[1])
+                
+                # Add explicit graph connection (Stair Edge)
+                self.robot.node_manager.add_stair_connection(old_floor_id, old_location, self.env.floor_id, self.env.robot_location)
+            except Exception as e:
+                print(f"[Worker] Error during floor transition: {e}", flush=True)
 
         # 4. Reset Robot Planning State
         # Preserve memory (graph) for multi-floor navigation
@@ -337,8 +369,31 @@ class Worker:
 
         if self.save_image:
             # self.robot.plot_env() # Agent does not have plot_env
-            self.ground_truth_node_manager.plot_ground_truth_env(self.env.robot_location, self.position_history, self.env.floor_id, self.env.stairs_coords_list)
-            self.env.plot_env(0)
+            stairs_coords_plot = []
+            try:
+                if hasattr(self.env, "discovered_stairs") and hasattr(self.env, "stairs_coords_list") and self.env.stairs_coords_list:
+                    for s_idx in sorted(list(self.env.discovered_stairs)):
+                        if 0 <= int(s_idx) < len(self.env.stairs_coords_list):
+                            stairs_coords_plot.append(self.env.stairs_coords_list[int(s_idx)])
+            except Exception:
+                stairs_coords_plot = []
+            self.ground_truth_node_manager.plot_ground_truth_env(self.env.robot_location, self.position_history, self.env.floor_id, stairs_coords_plot)
+            try:
+                self.env.plot_env(0)
+            except OSError as e:
+                try:
+                    if getattr(e, "errno", None) == 28:
+                        print(f"[Worker] Plot disabled (no space left on device).", flush=True)
+                except Exception:
+                    pass
+                try:
+                    self.save_image = False
+                    if hasattr(self.env, "plot"):
+                        self.env.plot = False
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         for i in range(MAX_EPISODE_STEP):
             if i % 10 == 0:
@@ -352,7 +407,15 @@ class Worker:
                  try:
                      plt.switch_backend('agg')
                      plt.figure(figsize=(10, 10))
-                     self.ground_truth_node_manager.plot_ground_truth_env(self.env.robot_location, self.position_history, self.env.floor_id, self.env.stairs_coords_list)
+                     stairs_coords_plot = []
+                     try:
+                         if hasattr(self.env, "discovered_stairs") and hasattr(self.env, "stairs_coords_list") and self.env.stairs_coords_list:
+                             for s_idx in sorted(list(self.env.discovered_stairs)):
+                                 if 0 <= int(s_idx) < len(self.env.stairs_coords_list):
+                                     stairs_coords_plot.append(self.env.stairs_coords_list[int(s_idx)])
+                     except Exception:
+                         stairs_coords_plot = []
+                     self.ground_truth_node_manager.plot_ground_truth_env(self.env.robot_location, self.position_history, self.env.floor_id, stairs_coords_plot)
                      graph_filename = '{}/{}_{}_graph.png'.format(gifs_path, self.global_step, i)
                      plt.savefig(graph_filename, dpi=100)
                      plt.close()
@@ -360,7 +423,22 @@ class Worker:
                      print(f"Warning: Graph plotting failed: {e}")
 
                  # 2. Plot and Save Environment View (Map + Camera)
-                 self.env.plot_env(i)
+                 try:
+                     self.env.plot_env(i)
+                 except OSError as e:
+                     try:
+                         if getattr(e, "errno", None) == 28:
+                             print(f"[Worker] Plot disabled (no space left on device).", flush=True)
+                     except Exception:
+                         pass
+                     try:
+                         self.save_image = False
+                         if hasattr(self.env, "plot"):
+                             self.env.plot = False
+                     except Exception:
+                         pass
+                 except Exception:
+                     pass
 
             force_global_plan = False
             is_rescue_move = False
@@ -377,7 +455,7 @@ class Worker:
 
             if i > 10 and len(self.position_history) > 0:
                 last_pos = np.array(self.position_history[-1])
-                curr_loc = np.array(self.robot.location)
+                curr_loc = np.array(self.env.robot_location)
                 # Compare 2D distance only, ignoring Z or floor_id
                 if np.linalg.norm(curr_loc[:2] - last_pos[:2]) < 0.05:
                     self.stuck_events += 1
@@ -459,7 +537,8 @@ class Worker:
                                 n.neighbor_set.add((curr.coords[0], curr.coords[1]))
                     path, length = self.robot.node_manager.a_star(self.robot.location, target_node.coords)
                     if path and length < 1e8:
-                        next_target = np.array(path[0])
+                        step_idx = 1 if len(path) > 1 else 0
+                        next_target = np.array(path[step_idx])
                         if next_target.shape[0] == 3:
                             next_target = next_target[1:]
 
@@ -468,7 +547,8 @@ class Worker:
                         dists = np.linalg.norm(neighbor_coords - next_target, axis=1)
                         best_idx = np.argmin(dists)
 
-                        if dists[best_idx] < 2.0:
+                        accept_radius = float(max(2.0, NODE_RESOLUTION * 1.8))
+                        if dists[best_idx] < accept_radius and np.linalg.norm(neighbor_coords[best_idx] - self.robot.location) > 0.2:
                             next_location = neighbor_coords[best_idx]
                             action_index = torch.tensor([[best_idx]]).long()
                             global_override_success = True
@@ -513,7 +593,8 @@ class Worker:
                                 dists = np.linalg.norm(neighbor_coords - target_pt, axis=1)
                                 best_idx = np.argmin(dists)
                                 
-                                if dists[best_idx] < 1.0:
+                                accept_radius = float(max(1.2, NODE_RESOLUTION * 0.9))
+                                if dists[best_idx] < accept_radius:
                                     next_location = neighbor_coords[best_idx]
                                     action_index = torch.tensor([[best_idx]]).long()
                                     global_override_success = True
@@ -570,11 +651,19 @@ class Worker:
 
                     print(f"Worker {self.meta_agent_id}: Calling VLM navigation logic (Step {i})...", flush=True)
                     debug_path = f"{gifs_path}/vlm_nav_{self.meta_agent_id}_step_{i}.png"
+                    stairs_coords_vlm = []
+                    try:
+                        if hasattr(self.env, "discovered_stairs") and hasattr(self.env, "stairs_coords_list") and self.env.stairs_coords_list:
+                            for s_idx in sorted(list(self.env.discovered_stairs)):
+                                if 0 <= int(s_idx) < len(self.env.stairs_coords_list):
+                                    stairs_coords_vlm.append(self.env.stairs_coords_list[int(s_idx)])
+                    except Exception:
+                        stairs_coords_vlm = []
                     
                     next_location, action_index = self.vlm.get_vlm_action(
                         self.robot, 
                         observation, 
-                        stairs_coords=self.env.stairs_coords_list, 
+                        stairs_coords=stairs_coords_vlm, 
                         rgb_image=rgb_img, 
                         debug_save_path=debug_path,
                         position_history=self.position_history,
@@ -729,6 +818,10 @@ class Worker:
                 
                 if best_frontier is not None:
                     self.current_exploration_target = np.array(best_frontier, dtype=float)
+                    self.target_stagnation_counter = 0
+                    self.last_target_distance = np.inf
+                    self.min_target_distance = np.inf
+                    self.zero_utility_steps = int(max(int(getattr(self, "zero_utility_steps", 0)), 6))
                     self.tabu_frontiers.append(best_frontier)
                     if len(self.tabu_frontiers) > 8:
                         self.tabu_frontiers.pop(0)
@@ -851,7 +944,8 @@ class Worker:
                                     print(f"Worker {self.meta_agent_id}: Graph A* failed to target {target_coords}. Trying Physical NavMesh Path...", flush=True)
                                     try:
                                         # 1. Compute Physical Path
-                                        sim_path = habitat_sim.ShortestPath()
+                                        import habitat_sim as _habitat_sim
+                                        sim_path = _habitat_sim.ShortestPath()
                                         sim_path.requested_start = self.env.sim.get_agent(0).get_state().position
                                         # Ensure target is 3D (y from current pos)
                                         target_y = self.env.sim.get_agent(0).get_state().position[1]
@@ -1079,10 +1173,32 @@ class Worker:
                             
                             if not found_target:
                                 print("Stagnation Rescue: Failed to find reachable random target. Skipping step.", flush=True)
-                                continue
+                                if self.env.sim and self.env.sim.pathfinder.is_loaded:
+                                    try:
+                                        target_pos = self.env.sim.pathfinder.get_random_navigable_point()
+                                        next_location = np.array([target_pos[0], target_pos[2]])
+                                        print(f"Stagnation Rescue: Falling back to NavMesh point {next_location} via step(force=True).", flush=True)
+                                        self.env.step(next_location, force=True)
+                                        self.robot.update_planning_state(self.env.belief_info, self.env.robot_location, self.env.floor_id)
+                                    except Exception as e:
+                                        print(f"Stagnation Rescue: NavMesh fallback failed: {e}", flush=True)
+                                        continue
+                                else:
+                                    continue
                         else:
                              print("Stagnation Rescue: No free space found in map?! Skipping step.", flush=True)
-                             continue
+                             if self.env.sim and self.env.sim.pathfinder.is_loaded:
+                                 try:
+                                     target_pos = self.env.sim.pathfinder.get_random_navigable_point()
+                                     next_location = np.array([target_pos[0], target_pos[2]])
+                                     print(f"Stagnation Rescue: Falling back to NavMesh point {next_location} via step(force=True).", flush=True)
+                                     self.env.step(next_location, force=True)
+                                     self.robot.update_planning_state(self.env.belief_info, self.env.robot_location, self.env.floor_id)
+                                 except Exception as e:
+                                     print(f"Stagnation Rescue: NavMesh fallback failed: {e}", flush=True)
+                                     continue
+                             else:
+                                 continue
                     except Exception as e:
                         print(f"Stagnation Rescue Error: {e}", flush=True)
                         continue
@@ -1097,14 +1213,67 @@ class Worker:
                 dists = np.linalg.norm(check - next_location, axis=1)
                 idx = np.argmin(dists)
                 next_location = check[idx]
+
+            try:
+                min_step_dist = float(os.environ.get("HABITAT_MIN_STEP_DIST", "0.8"))
+            except Exception:
+                min_step_dist = 0.8
+            min_step_dist = float(max(0.05, min(min_step_dist, 20.0)))
+            try:
+                curr_xy = np.array(self.robot.location, dtype=float).reshape(2)
+                nxt_xy = np.array(next_location, dtype=float).reshape(2)
+                if float(np.linalg.norm(nxt_xy - curr_xy)) < min_step_dist:
+                    cand = []
+                    if node is not None:
+                        for n in list(node.data.neighbor_set):
+                            p = np.array(n, dtype=float).reshape(2)
+                            d = float(np.linalg.norm(p - curr_xy))
+                            if d >= min_step_dist:
+                                cand.append((d, p))
+                    if not cand and len(check) > 0:
+                        for p0 in check:
+                            p = np.array(p0, dtype=float).reshape(2)
+                            d = float(np.linalg.norm(p - curr_xy))
+                            if d >= min_step_dist:
+                                cand.append((d, p))
+                    if cand:
+                        cand.sort(key=lambda t: -t[0])
+                        next_location = cand[0][1]
+            except Exception:
+                pass
             
-            if next_location[0] == self.robot.location[0] and next_location[1] == self.robot.location[1]:
+            same_loc = False
+            try:
+                curr_xy = np.array(self.robot.location, dtype=float).reshape(2)
+                nxt_xy = np.array(next_location, dtype=float).reshape(2)
+                same_loc = float(np.linalg.norm(nxt_xy - curr_xy)) < 0.05
+            except Exception:
+                try:
+                    same_loc = (next_location[0] == self.robot.location[0] and next_location[1] == self.robot.location[1])
+                except Exception:
+                    same_loc = True
+
+            if same_loc:
                 print("Warning: Agent selected current location. Forcing random move.")
                 # Filter out current location from neighbors if present
                 valid_neighbors = []
                 if node is not None:
-                     # Filter neighbors
-                     valid_neighbors = [n for n in list(node.data.neighbor_set) if n != (self.robot.location[0], self.robot.location[1])]
+                     # Filter neighbors (distance-based to avoid float equality issues)
+                     try:
+                         curr_xy = np.array(self.robot.location, dtype=float).reshape(2)
+                     except Exception:
+                         curr_xy = None
+                     for n in list(node.data.neighbor_set):
+                         try:
+                             p = np.array(n, dtype=float).reshape(2)
+                         except Exception:
+                             continue
+                         if curr_xy is not None:
+                             d = float(np.linalg.norm(p - curr_xy))
+                             if d > 0.2:
+                                 valid_neighbors.append(p)
+                         else:
+                             valid_neighbors.append(p)
                 
                 # If no valid neighbors in graph, try to find ANY reachable node in belief map
                 if not valid_neighbors:
@@ -1166,26 +1335,27 @@ class Worker:
                              
                              # Try to validate with Physical PathFinder if available
                              if self.env.sim and self.env.sim.pathfinder.is_loaded:
-                                 try:
-                                     sim_path = habitat_sim.ShortestPath()
-                                     sim_path.requested_start = self.env.sim.get_agent(0).get_state().position
-                                     target_y = self.env.sim.get_agent(0).get_state().position[1]
-                                     sim_path.requested_end = np.array([best_unsafe[0], target_y, best_unsafe[1]])
-                                     found_sim_path = self.env.sim.pathfinder.find_path(sim_path)
+                                try:
+                                    import habitat_sim as _habitat_sim
+                                    sim_path = _habitat_sim.ShortestPath()
+                                    sim_path.requested_start = self.env.sim.get_agent(0).get_state().position
+                                    target_y = self.env.sim.get_agent(0).get_state().position[1]
+                                    sim_path.requested_end = np.array([best_unsafe[0], target_y, best_unsafe[1]])
+                                    found_sim_path = self.env.sim.pathfinder.find_path(sim_path)
                                      
-                                     if found_sim_path:
-                                         print(f"Recovery: Physical Path VALIDATED to unsafe node {best_unsafe}. Using it.", flush=True)
-                                         valid_neighbors = [best_unsafe]
-                                         # Add connection
-                                         if node:
-                                             node.data.neighbor_set.add((best_unsafe[0], best_unsafe[1]))
-                                             neighbor_node_wrapper = self.robot.node_manager.nodes_dict.find((best_unsafe[0], best_unsafe[1]))
-                                             if neighbor_node_wrapper:
-                                                 neighbor_node_wrapper.data.neighbor_set.add((node.data.coords[0], node.data.coords[1]))
-                                     else:
-                                         print(f"Recovery: Physical Path FAILED to unsafe node {best_unsafe}. Will fall back to Ultimate Rescue.", flush=True)
-                                 except Exception as e:
-                                     print(f"Recovery: Physical Path Check Error: {e}", flush=True)
+                                    if found_sim_path:
+                                        print(f"Recovery: Physical Path VALIDATED to unsafe node {best_unsafe}. Using it.", flush=True)
+                                        valid_neighbors = [best_unsafe]
+                                        # Add connection
+                                        if node:
+                                            node.data.neighbor_set.add((best_unsafe[0], best_unsafe[1]))
+                                            neighbor_node_wrapper = self.robot.node_manager.nodes_dict.find((best_unsafe[0], best_unsafe[1]))
+                                            if neighbor_node_wrapper:
+                                                neighbor_node_wrapper.data.neighbor_set.add((node.data.coords[0], node.data.coords[1]))
+                                    else:
+                                        print(f"Recovery: Physical Path FAILED to unsafe node {best_unsafe}. Will fall back to Ultimate Rescue.", flush=True)
+                                except Exception as e:
+                                    print(f"Recovery: Physical Path Check Error: {e}", flush=True)
 
                     
                     # --- CRITICAL FALLBACK: TELEPORT TO RANDOM NAVIGABLE POINT ---
@@ -1199,7 +1369,7 @@ class Worker:
                                  next_location = np.array([target_pos[0], target_pos[2]])
                                  
                                  # Teleport SIM AGENT directly (since step() might fail if path is blocked)
-                                 new_state = habitat_sim.AgentState()
+                                 new_state = self.env.sim.get_agent(0).get_state()
                                  new_state.position = target_pos
                                  self.env.sim.get_agent(0).set_state(new_state)
                                  
@@ -1293,6 +1463,41 @@ class Worker:
                             # Get current agent state
                             agent_state = self.env.sim.get_agent(0).get_state()
                             current_height = agent_state.position[1]
+                            try:
+                                min_jump_dist = float(os.environ.get("HABITAT_STUCK_RECOVERY_MIN_JUMP_DIST", "3.0"))
+                            except Exception:
+                                min_jump_dist = 3.0
+                            try:
+                                max_jump_dist = float(os.environ.get("HABITAT_STUCK_RECOVERY_MAX_JUMP_DIST", "7.0"))
+                            except Exception:
+                                max_jump_dist = 7.0
+                            min_jump_dist = float(max(0.0, min(min_jump_dist, 50.0)))
+                            max_jump_dist = float(max(min_jump_dist, min(max_jump_dist, 200.0)))
+                            try:
+                                height_tol = float(os.environ.get("HABITAT_STUCK_RECOVERY_HEIGHT_TOL", "0.5"))
+                            except Exception:
+                                height_tol = 0.5
+                            height_tol = float(max(0.0, min(height_tol, 5.0)))
+
+                            def _in_mapper_bounds(pos3):
+                                try:
+                                    mapper = getattr(self.env, "mapper", None)
+                                    if mapper is None:
+                                        return True
+                                    gmap = getattr(mapper, "global_map", None)
+                                    if gmap is None:
+                                        return True
+                                    h_map, w_map = gmap.shape
+                                    px = int((float(pos3[0]) - float(mapper.origin_x)) / float(mapper.cell_size))
+                                    py = int((float(pos3[2]) - float(mapper.origin_y)) / float(mapper.cell_size))
+                                    try:
+                                        margin = int(os.environ.get("HABITAT_STUCK_RECOVERY_MAP_MARGIN_PX", "8"))
+                                    except Exception:
+                                        margin = 8
+                                    margin = int(max(0, min(margin, 256)))
+                                    return (margin <= px < (int(w_map) - margin)) and (margin <= py < (int(h_map) - margin))
+                                except Exception:
+                                    return True
                             
                             # Try up to 50 times to find a point on the same floor
                             for _ in range(50):
@@ -1300,10 +1505,10 @@ class Worker:
                                 rnd_pt = self.env.sim.pathfinder.get_random_navigable_point()
                                 # Check height difference (allow 0.5m variance for slopes/steps)
                                 # This ensures we stay on the current floor/connected component
-                                if abs(rnd_pt[1] - current_height) < 0.5:
+                                if abs(rnd_pt[1] - current_height) < float(height_tol):
                                     # Check distance from current position
                                     dist = np.linalg.norm(rnd_pt - agent_state.position)
-                                    if dist > 3.0: # Minimum jump distance to break loop
+                                    if float(min_jump_dist) <= dist <= float(max_jump_dist) and _in_mapper_bounds(rnd_pt):
                                         target_pos_3d = rnd_pt
                                         print(f"Stuck Recovery: Found valid random point {target_pos_3d} (dist={dist:.2f})", flush=True)
                                         break
@@ -1344,7 +1549,8 @@ class Worker:
                         try:
                             # Verify path existence first (Physical Validity Check)
                             # We want to see if we can actually WALK there instead of teleporting
-                            path = habitat_sim.ShortestPath()
+                            import habitat_sim as _habitat_sim
+                            path = _habitat_sim.ShortestPath()
                             path.requested_start = self.env.sim.get_agent(0).get_state().position
                             path.requested_end = target_pos_3d
                             found_path = self.env.sim.pathfinder.find_path(path)
@@ -1408,19 +1614,21 @@ class Worker:
                         print("Stuck Recovery FAILED: Could not find valid target.", flush=True)
 
             
-            if self.robot.utility.sum() <= 0.05: # Threshold to ignore sensor noise
+            if self.current_exploration_target is not None:
+                self.zero_utility_steps = int(max(int(getattr(self, "zero_utility_steps", 0)), 6))
+            elif self.robot.utility.sum() <= 0.05: # Threshold to ignore sensor noise
                 self.zero_utility_steps += 1
             else:
                 self.zero_utility_steps = 0
                 self.tabu_exploration_targets = [] # Reset tabu list when we find SIGNIFICANT utility
-                if self.current_exploration_target is not None:
-                    print(f"Worker {self.meta_agent_id}: High Utility ({self.robot.utility.sum():.2f}). Clearing Forced Target.", flush=True)
-                    self.current_exploration_target = None
 
 
             # Only force exploration if utility is 0 for a while (give model a chance)
             if self.zero_utility_steps > 5:
-                print(f"Warning: Utility sum is 0 for {self.zero_utility_steps} steps. Model inputs are empty. Activating Forced Exploration to find new frontiers...", flush=True)
+                if self.current_exploration_target is not None:
+                    print(f"Worker {self.meta_agent_id}: Forced Target active. Activating Forced Exploration (counter={self.zero_utility_steps}).", flush=True)
+                else:
+                    print(f"Warning: Utility sum is 0 for {self.zero_utility_steps} steps. Model inputs are empty. Activating Forced Exploration to find new frontiers...", flush=True)
                 # Debug: Print node info
                 print(f"Node count: {len(self.robot.node_manager.nodes_dict)}")
                 
@@ -1530,9 +1738,17 @@ class Worker:
                                 # Use get_vlm_action to pick a direction from neighbors
                                 # Note: get_vlm_action internally calls VLM API to select best neighbor
                                 debug_path = f"{gifs_path}/vlm_rescue_{self.meta_agent_id}_step_{self.zero_utility_steps}.png"
+                                stairs_coords_vlm = []
+                                try:
+                                    if hasattr(self.env, "discovered_stairs") and hasattr(self.env, "stairs_coords_list") and self.env.stairs_coords_list:
+                                        for s_idx in sorted(list(self.env.discovered_stairs)):
+                                            if 0 <= int(s_idx) < len(self.env.stairs_coords_list):
+                                                stairs_coords_vlm.append(self.env.stairs_coords_list[int(s_idx)])
+                                except Exception:
+                                    stairs_coords_vlm = []
 
                                 # observation arg is unused in VLM adapter, passing None to avoid NameError
-                                next_loc, _ = self.vlm.get_vlm_action(self.robot, None, self.env.stairs_coords_list, rgb_image=rgb_img, debug_save_path=debug_path, position_history=self.position_history, current_floor=self.env.floor_id)
+                                next_loc, _ = self.vlm.get_vlm_action(self.robot, None, stairs_coords_vlm, rgb_image=rgb_img, debug_save_path=debug_path, position_history=self.position_history, current_floor=self.env.floor_id)
                                 
                                 # TABU CHECK for VLM
                                 if next_loc is not None:
@@ -1833,24 +2049,15 @@ class Worker:
                                         for d, n in cand[:3]:
                                             curr.neighbor_set.add((n.coords[0], n.coords[1]))
                                             n.neighbor_set.add((curr.coords[0], curr.coords[1]))
-                                # Use get_shortest_path from HabitatEnv
+                                # Use NavMesh reachability check, but execute the FULL move to the target in one env.step.
+                                # HabitatEnv.step() already simulates intermediate movement internally and updates the map.
                                 path = self.env.get_shortest_path(self.robot.location, target_coords)
                                 if path and len(path) > 1:
-                                    chosen_pt = None
-                                    for idx in range(1, len(path)):
-                                        cand = path[idx]
-                                        if np.linalg.norm(cand - self.robot.location) > 0.2:
-                                            chosen_pt = cand
-                                            break
-                                    if chosen_pt is not None:
-                                        print(f"Forced Exploration Move to {chosen_pt}", flush=True)
-                                        self.env.step(chosen_pt, force=True)
-                                        self.robot.update_planning_state(self.env.belief_info, self.env.robot_location, self.env.floor_id)
-                                    else:
-                                        print("Forced Move produced current location for all waypoints. Skipping.", flush=True)
-                                        self.current_exploration_target = None
+                                    print(f"Forced Exploration Move to target {np.array(target_coords).flatten()[:2]}", flush=True)
+                                    self.env.step(target_coords, force=True)
+                                    self.robot.update_planning_state(self.env.belief_info, self.env.robot_location, self.env.floor_id)
                                 else:
-                                    print(f"Forced Move Failed: No path to {target_coords}. Clearing target.", flush=True)
+                                    print(f"Forced Move Failed: No NavMesh path to {target_coords}. Clearing target.", flush=True)
                                     self.tabu_exploration_targets.append(np.array(target_coords, dtype=float).flatten()[:2])
                                     if len(self.tabu_exploration_targets) > 5:
                                         self.tabu_exploration_targets.pop(0)
@@ -1907,19 +2114,9 @@ class Worker:
                                                 path_check = self.env.get_shortest_path(self.robot.location, rn_pt)
                                                 if path_check and len(path_check) > 1:
                                                     print(f"Forced Exploration Fallback: Moving to neighbor {rn_pt} (Path Valid)", flush=True)
-                                                    step_pt = None
-                                                    for j in range(1, len(path_check)):
-                                                        cand2 = path_check[j]
-                                                        if np.linalg.norm(cand2 - self.robot.location) > 0.2:
-                                                            step_pt = cand2
-                                                            break
-                                                    if step_pt is not None:
-                                                        self.env.step(step_pt, force=True) 
-                                                        move_successful = True
-                                                        break
-                                                    else:
-                                                        # If path exists but only returns current location, skip this neighbor
-                                                        continue
+                                                    self.env.step(rn_pt, force=True)
+                                                    move_successful = True
+                                                    break
                                             
                                             if not move_successful:
                                                 # If all path checks fail, try direct step to a random one as last resort

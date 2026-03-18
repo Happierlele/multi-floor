@@ -49,13 +49,33 @@ class Worker:
             # default_base = "https://dashscope.aliyuncs.com/compatible-mode/v1" # 国内版
             default_base = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" # 国际版
             base = vlm_base_url or os.getenv("QWEN_BASE_URL") or default_base
+            def _sanitize_base_url(u):
+                if u is None:
+                    return None
+                s = str(u).strip()
+                if (s.startswith(("`", "'", "\"")) and s.endswith(("`", "'", "\"")) and len(s) >= 2):
+                    s = s[1:-1].strip()
+                s = s.strip().strip("`").strip()
+                return s or None
+
+            def _sanitize_key(k):
+                if k is None:
+                    return None
+                s = str(k).strip()
+                if (s.startswith(("`", "'", "\"", "“", "‘")) and s.endswith(("`", "'", "\"", "”", "’")) and len(s) >= 2):
+                    s = s[1:-1].strip()
+                s = s.strip().strip("`").strip()
+                return s or None
+
+            base = _sanitize_base_url(base) or default_base
+            key = _sanitize_key(key)
             
             if not key:
                 print("[Worker] QWEN_API_KEY not set. Disabling VLM.", flush=True)
                 self.use_vlm = False
                 self.vlm = None
             else:
-                print(f"[Worker] Initializing VLM with Key: {key[:6]}...{key[-4:]}, Base URL: {base}")
+                print(f"[Worker] Initializing VLM (key_set=1, base_url={base})", flush=True)
                 self.vlm = VLMAdapter(model_name=vlm_model_name, api_key=key, base_url=base)
 
         self.episode_buffer = []
@@ -190,7 +210,8 @@ class Worker:
                 if target_node is not None:
                     path, length = self.robot.node_manager.a_star(self.robot.location, target_node.coords)
                     if path and length < 1e8:
-                        next_target = np.array(path[0])
+                        step_idx = 1 if len(path) > 1 else 0
+                        next_target = np.array(path[step_idx])
                         neighbor_indices = self.robot.neighbor_indices
                         neighbor_coords = self.robot.node_coords[neighbor_indices]
                         dists = np.linalg.norm(neighbor_coords - next_target, axis=1)
@@ -420,7 +441,7 @@ class Worker:
                         self.perform_stair_transition(i, self.target_stairs_index)
             
             # Round to integer to avoid float jitter masking stuck state
-            self.position_history.append((round(self.env.robot_location[0]), round(self.env.robot_location[1])))
+            self.position_history.append((round(self.env.robot_location[0], 2), round(self.env.robot_location[1], 2)))
             if len(self.position_history) > STUCK_WINDOW:
                 self.position_history.pop(0)
             if len(self.position_history) == STUCK_WINDOW:

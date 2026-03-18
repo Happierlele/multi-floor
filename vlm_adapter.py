@@ -13,6 +13,9 @@ class VLMAdapter:
         self.provider = self._infer_provider(model_name)
         self.client = None
         self.use_legacy_openai = False
+        self.http_fallback = False
+        self._http_api_key = None
+        self._http_base_url = None
         self._last_single_candidate = None
         self._single_repeat_count = 0
         
@@ -20,6 +23,30 @@ class VLMAdapter:
             import os
             key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("QWEN_API_KEY")
             base = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("QWEN_BASE_URL")
+
+            def _sanitize_base_url(u):
+                if u is None:
+                    return None
+                s = str(u).strip()
+                if (s.startswith(("`", "'", "\"")) and s.endswith(("`", "'", "\"")) and len(s) >= 2):
+                    s = s[1:-1].strip()
+                s = s.strip().strip("`").strip()
+                return s or None
+
+            def _sanitize_key(k):
+                if k is None:
+                    return None
+                s = str(k).strip()
+                if (s.startswith(("`", "'", "\"", "“", "‘")) and s.endswith(("`", "'", "\"", "”", "’")) and len(s) >= 2):
+                    s = s[1:-1].strip()
+                s = s.strip().strip("`").strip()
+                return s or None
+
+            base = _sanitize_base_url(base)
+            key = _sanitize_key(key)
+            self.base_url = base
+            self._http_api_key = key
+            self._http_base_url = base
             
             try:
                 from openai import OpenAI
@@ -36,7 +63,11 @@ class VLMAdapter:
                     print("[VLMAdapter] Using legacy OpenAI API (v0.28)")
                 except ImportError:
                     self.client = None
-                    print("[VLMAdapter] OpenAI library not found")
+                    if key and base:
+                        self.http_fallback = True
+                        print("[VLMAdapter] OpenAI library not found. Using HTTP fallback.", flush=True)
+                    else:
+                        print("[VLMAdapter] OpenAI library not found", flush=True)
         elif self.provider == "gemini":
             try:
                 import google.generativeai as genai
@@ -425,6 +456,34 @@ Please output ONLY the number of the selected candidate waypoint (e.g., "3").
                     return resp['choices'][0]['message']['content']
                 except Exception as e:
                     print(f"[VLMAdapter] Legacy OpenAI error: {e}")
+            elif self.http_fallback:
+                try:
+                    import json
+                    import urllib.request
+
+                    base = (self._http_base_url or "").strip().rstrip("/")
+                    if not base:
+                        return None
+                    url = base + "/chat/completions"
+                    payload = {
+                        "model": actual_model,
+                        "messages": messages,
+                    }
+                    data = json.dumps(payload).encode("utf-8")
+                    headers = {"Content-Type": "application/json"}
+                    if self._http_api_key:
+                        headers["Authorization"] = f"Bearer {self._http_api_key}"
+                    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        body = resp.read().decode("utf-8", errors="replace")
+                    obj = json.loads(body)
+                    choices = obj.get("choices") or []
+                    if choices and isinstance(choices, list):
+                        msg = (choices[0] or {}).get("message") or {}
+                        content = msg.get("content")
+                        return content
+                except Exception as e:
+                    print(f"[VLMAdapter] HTTP fallback error: {e}")
         if self.provider == "gemini" and self.client:
             try:
                 resp = self.client.generate_content([prompt, {"mime_type": "image/png", "data": image_bytes}])
@@ -446,6 +505,124 @@ Please output ONLY the number of the selected candidate waypoint (e.g., "3").
             except Exception as e:
                 print(f"[VLMAdapter] Anthropic error: {e}")
         return self._mock_choice(prompt)
+
+    def detect_stairs_in_rgb(self, rgb_image):
+        if rgb_image is None:
+            return {"is_stairs": None, "confidence": None, "raw": None}
+        has_backend = bool(self.client) or bool(self.use_legacy_openai) or bool(self.http_fallback) or (self.provider == "gemini" and self.client) or (self.provider == "anthropic" and self.client)
+        if not has_backend:
+            return {"is_stairs": None, "confidence": None, "raw": None}
+
+        try:
+            arr = np.asarray(rgb_image)
+            if arr.ndim != 3 or arr.shape[-1] < 3:
+                return {"is_stairs": None, "confidence": None, "raw": None}
+            arr = arr[..., :3]
+            if arr.dtype != np.uint8:
+                amax = float(np.nanmax(arr)) if np.size(arr) else 1.0
+                if np.isfinite(amax) and amax <= 1.05:
+                    arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    arr = np.clip(arr, 0, 255).astype(np.uint8)
+            try:
+                a = arr.astype(np.float32, copy=False)
+                p2 = np.nanpercentile(a, 2, axis=(0, 1))
+                p98 = np.nanpercentile(a, 98, axis=(0, 1))
+                rng = np.maximum(1.0, (p98 - p2))
+                a = (a - p2) * (255.0 / rng)
+                a = np.clip(a, 0.0, 255.0)
+                if float(np.nanmean(p98 - p2)) < 45.0:
+                    gamma = 0.85
+                    a = 255.0 * np.power(np.clip(a / 255.0, 0.0, 1.0), gamma)
+                arr = a.astype(np.uint8)
+            except Exception:
+                pass
+
+            h, w = int(arr.shape[0]), int(arr.shape[1])
+            y0 = int(max(0, round(0.30 * h)))
+            x0 = int(max(0, round(0.15 * w)))
+            x1 = int(min(w, round(0.85 * w)))
+            crop = arr[y0:h, x0:x1, :]
+            img_full = Image.fromarray(arr)
+            img_crop = Image.fromarray(crop) if crop.size else img_full
+            try:
+                img_crop = img_crop.resize((img_full.size[0], img_full.size[1]))
+            except Exception:
+                img_crop = img_full
+
+            try:
+                composite = Image.new("RGB", (img_full.size[0] * 2, img_full.size[1]))
+                composite.paste(img_full, (0, 0))
+                composite.paste(img_crop, (img_full.size[0], 0))
+                img = composite
+            except Exception:
+                img = img_full
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+        except Exception:
+            return {"is_stairs": None, "confidence": None, "raw": None}
+
+        prompt = (
+            "你是室内机器人导航的视觉检验员。请判断图中是否清晰出现“楼梯/台阶/楼梯间”(staircase/steps)，可以让机器人上/下楼。\n"
+            "注意：地毯纹理、栏杆、桌椅、门框、阴影、地砖线条、斜坡不算楼梯。\n"
+            "请只输出一行 JSON（不要输出其它内容）：\n"
+            "{\"stairs\": true/false, \"confidence\": 0.0-1.0, \"reason\": \"短语\"}\n"
+        )
+        raw = None
+        try:
+            raw = self.call_vlm_api(image_bytes, prompt)
+        except Exception:
+            raw = None
+
+        if not raw:
+            return {"is_stairs": None, "confidence": None, "raw": raw}
+
+        text0 = str(raw).strip()
+        text = text0.lower()
+        is_stairs = None
+        conf = None
+
+        try:
+            import json, re
+            m = re.search(r"\{[\s\S]*\}", text0)
+            if m:
+                obj = json.loads(m.group(0))
+                v = obj.get("stairs", obj.get("is_stairs", None))
+                if isinstance(v, str):
+                    v2 = v.strip().lower()
+                    if v2 in ("true", "yes", "y", "1", "是", "有"):
+                        v = True
+                    elif v2 in ("false", "no", "n", "0", "否", "没有", "不是"):
+                        v = False
+                    else:
+                        v = None
+                if isinstance(v, bool):
+                    is_stairs = bool(v)
+                c = obj.get("confidence", None)
+                if c is not None:
+                    conf = float(c)
+                    conf = float(max(0.0, min(1.0, conf)))
+        except Exception:
+            is_stairs = None
+            conf = None
+
+        if "stairs: yes" in text or text.startswith("yes") or "楼梯" in text and ("有" in text or "是" in text):
+            is_stairs = True
+        if "stairs: no" in text or text.startswith("no") or ("楼梯" in text and ("没有" in text or "否" in text or "不是" in text)):
+            is_stairs = False
+
+        if conf is None:
+            try:
+                import re
+                m = re.search(r'confidence\s*[:=]\s*([01](?:\.\d+)?)', text)
+                if m:
+                    conf = float(m.group(1))
+                    conf = float(max(0.0, min(1.0, conf)))
+            except Exception:
+                conf = None
+
+        return {"is_stairs": is_stairs, "confidence": conf, "raw": raw}
 
     def _infer_provider(self, model_name):
         m = model_name.lower()

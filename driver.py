@@ -119,7 +119,22 @@ ray.init(
 print("Ray init done.", flush=True)
 print("Welcome to RL autonomous exploration!", flush=True)
 
-writer = SummaryWriter(train_path)
+writer = None
+try:
+    writer = SummaryWriter(train_path)
+except OSError as e:
+    try:
+        if getattr(e, "errno", None) == 28:
+            print(f"[Driver] TensorBoard disabled (no space left on device) for logdir={train_path}", flush=True)
+        else:
+            print(f"[Driver] TensorBoard disabled due to OSError: {e}", flush=True)
+    except Exception:
+        pass
+except Exception as e:
+    try:
+        print(f"[Driver] TensorBoard disabled due to error: {e}", flush=True)
+    except Exception:
+        pass
 if not os.path.exists(model_path):
     os.makedirs(model_path)
 if not os.path.exists(gifs_path):
@@ -540,26 +555,47 @@ def main():
 
 
 def write_to_tensor_board(writer, tensorboard_data, curr_episode):
+    if writer is None:
+        return
+    if bool(getattr(writer, "_hab_no_space", False)):
+        return
     # each row in tensorboardData represents an episode
     # each column is a specific metric
 
     tensorboard_data = np.array(tensorboard_data)
     tensorboard_data = list(np.nanmean(tensorboard_data, axis=0))
     reward, value, policy_loss, q_value_loss, entropy, policy_grad_norm, q_value_grad_norm, log_alpha, alpha_loss, ss_loss, travel_dist, success_rate, explored_rate = tensorboard_data
-
-    writer.add_scalar(tag='Losses/Value', scalar_value=value, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Policy Loss', scalar_value=policy_loss, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Alpha Loss', scalar_value=alpha_loss, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Q Value Loss', scalar_value=q_value_loss, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Entropy', scalar_value=entropy, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Policy Grad Norm', scalar_value=policy_grad_norm, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Q Value Grad Norm', scalar_value=q_value_grad_norm, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Log Alpha', scalar_value=log_alpha, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/StairSwitch Loss', scalar_value=ss_loss, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Reward', scalar_value=reward, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Travel Distance', scalar_value=travel_dist, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Explored Rate', scalar_value=explored_rate, global_step=curr_episode)
-    writer.add_scalar(tag='Perf/Success Rate', scalar_value=success_rate, global_step=curr_episode)
+    try:
+        writer.add_scalar(tag='Losses/Value', scalar_value=value, global_step=curr_episode)
+        writer.add_scalar(tag='Losses/Policy Loss', scalar_value=policy_loss, global_step=curr_episode)
+        writer.add_scalar(tag='Losses/Alpha Loss', scalar_value=alpha_loss, global_step=curr_episode)
+        writer.add_scalar(tag='Losses/Q Value Loss', scalar_value=q_value_loss, global_step=curr_episode)
+        writer.add_scalar(tag='Losses/Entropy', scalar_value=entropy, global_step=curr_episode)
+        writer.add_scalar(tag='Losses/Policy Grad Norm', scalar_value=policy_grad_norm, global_step=curr_episode)
+        writer.add_scalar(tag='Losses/Q Value Grad Norm', scalar_value=q_value_grad_norm, global_step=curr_episode)
+        writer.add_scalar(tag='Losses/Log Alpha', scalar_value=log_alpha, global_step=curr_episode)
+        writer.add_scalar(tag='Losses/StairSwitch Loss', scalar_value=ss_loss, global_step=curr_episode)
+        writer.add_scalar(tag='Perf/Reward', scalar_value=reward, global_step=curr_episode)
+        writer.add_scalar(tag='Perf/Travel Distance', scalar_value=travel_dist, global_step=curr_episode)
+        writer.add_scalar(tag='Perf/Explored Rate', scalar_value=explored_rate, global_step=curr_episode)
+        writer.add_scalar(tag='Perf/Success Rate', scalar_value=success_rate, global_step=curr_episode)
+    except OSError as e:
+        try:
+            if getattr(e, "errno", None) == 28:
+                print(f"[Driver] TensorBoard write failed (no space left on device). Disabling further writes.", flush=True)
+        except Exception:
+            pass
+        try:
+            setattr(writer, "_hab_no_space", True)
+        except Exception:
+            pass
+        try:
+            writer.close()
+        except Exception:
+            pass
+        return
+    except Exception:
+        return
 
 
 if __name__ == "__main__":
